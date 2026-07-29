@@ -230,7 +230,15 @@ async def run_one_unit(
             # ============================================================
             writer.emit_event("provision_started")
             env = ALEEnv(provider=provider, spec=env_spec)
-            await env.reset_async()
+            try:
+                await asyncio.wait_for(
+                    env.reset_async(),
+                    timeout=max(18000.0, float(timeout_s)),
+                )
+            except (asyncio.TimeoutError, TimeoutError) as exc:
+                raise TimeoutError(
+                    f"VM provisioning timed out after {max(18000.0, float(timeout_s))}s"
+                ) from exc
             writer.emit_event(
                 "provision_done",
                 env_id=env.sandbox.id,

@@ -47,7 +47,7 @@ _DEFAULT_CPU_MACHINE = "c4-standard-8"
 _DEFAULT_GPU_MACHINE = "g2-standard-8"
 
 # VM-create retry tuning.
-_GCP_MAX_RETRIES_TRANSIENT = 3
+_GCP_MAX_RETRIES_TRANSIENT = 10
 _GCP_TRANSIENT_BASE_DELAY = 15          # seconds, exponential backoff
 _CUA_READY_STABLE_SUCCESSES = 2         # consecutive /status oks before "ready"
 
@@ -383,14 +383,38 @@ def generate_vm_name(
     return name[:63]
 
 
-async def _run_gcloud(*args: str, project: str) -> tuple[int, str, str]:
+async def _run_gcloud(*args: str, project: str, timeout: float | None = 1800.0) -> tuple[int, str, str]:
     cmd = ["gcloud", *args, f"--project={project}"]
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout_b, stderr_b = await proc.communicate()
+    if timeout is not None:
+        comm_task = asyncio.create_task(proc.communicate())
+        done, pending = await asyncio.wait([comm_task], timeout=timeout)
+        if not done:
+            logger.error("gcloud command timed out after %ss: %s", timeout, " ".join(cmd))
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                if proc.stdout and getattr(proc.stdout, "_transport", None):
+                    proc.stdout._transport.close()
+                if proc.stderr and getattr(proc.stderr, "_transport", None):
+                    proc.stderr._transport.close()
+            except Exception:
+                pass
+            comm_task.cancel()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5.0)
+            except Exception:
+                pass
+            return -1, "", f"gcloud command timed out after {timeout}s: {' '.join(cmd)}"
+        stdout_b, stderr_b = comm_task.result()
+    else:
+        stdout_b, stderr_b = await proc.communicate()
     return (
         proc.returncode or 0,
         stdout_b.decode(errors="replace"),
@@ -519,7 +543,7 @@ async def _try_create_in_zone(
                 )
                 await _delete_vm(name, zone, project)
             if attempt < _GCP_MAX_RETRIES_TRANSIENT:
-                delay = _GCP_TRANSIENT_BASE_DELAY * (2 ** (attempt - 1))
+                delay = min(300, _GCP_TRANSIENT_BASE_DELAY * (2 ** (attempt - 1)))
                 logger.warning(
                     "VM create transient error (attempt %d/%d): %s — retrying in %ds",
                     attempt,
@@ -553,6 +577,7 @@ async def _poll_for_ip(name: str, zone: str, project: str, timeout: float = 120)
             f"--zone={zone}",
             "--format=json",
             project=project,
+            timeout=30.0,
         )
         if rc == 0:
             try:
