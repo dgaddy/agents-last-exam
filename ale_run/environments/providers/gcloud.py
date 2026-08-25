@@ -231,6 +231,32 @@ def _machine_chain(machine_type: str, *, is_gpu: bool) -> tuple[str, ...]:
 
 
 # ============================================================================
+# Zone load-balancing helper
+# ============================================================================
+
+
+def _shuffle_zones_by_region(zones: tuple[str, ...]) -> tuple[str, ...]:
+    """Shuffle zones within each geographic region tier to distribute load
+    evenly across candidate zones while preserving regional preference
+    (e.g. US -> Europe -> Asia)."""
+    if not zones:
+        return ()
+    groups: list[list[str]] = []
+    current_prefix = ""
+    for z in zones:
+        prefix = z.split("-")[0]
+        if not groups or prefix != current_prefix:
+            groups.append([z])
+            current_prefix = prefix
+        else:
+            groups[-1].append(z)
+    shuffled: list[str] = []
+    for grp in groups:
+        shuffled.extend(random.sample(grp, len(grp)))
+    return tuple(shuffled)
+
+
+# ============================================================================
 # Label sanitization
 # ============================================================================
 
@@ -755,7 +781,11 @@ def _init_computer_skip_wait(session: Any) -> None:
         noVNC_port=session._vnc_port,
     )
 
-    interface = InterfaceFactory.create_interface_for_os(
+    interface = InterfaceFactory.createInterface_for_os(
+        os=session._os_type,
+        ip_address=session._api_host,
+        api_port=session._api_port,
+    ) if hasattr(InterfaceFactory, "createInterface_for_os") else InterfaceFactory.create_interface_for_os(
         os=session._os_type,
         ip_address=session._api_host,
         api_port=session._api_port,
@@ -801,7 +831,9 @@ class GcloudProvider(Provider):
             )
 
         is_gpu = snap.gpu is not None
-        zones = snap.zones
+        # Shuffle zones within their geographic tier to balance load across zones
+        # while keeping regional preference (US -> EU -> Asia).
+        zones = _shuffle_zones_by_region(snap.zones)
 
         # Machine fallback: task-card override (or default) → N2 (CPU only).
         base_machine = spec.machine_type or (
