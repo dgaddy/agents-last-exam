@@ -49,9 +49,26 @@ snapshots:
       project: ${env:GCP_PROJECT}
       service_account_key: ${env:GCP_SA_KEY}
       instance_prefix: ale
-      network: ale-vpc
-      subnet: ale-vpc
-      zones: [us-central1-a, us-east1-b, us-west1-a]
+      network: default
+      subnet: default
+      zones: [
+        # US Regions
+        us-central1-a, us-central1-b, us-central1-c,
+        us-east1-b, us-east1-c, us-east1-d,
+        us-east4-a, us-east4-c,
+        us-east7-b,
+        us-west1-a, us-west1-b, us-west1-c,
+        us-west4-a, us-west4-c,
+        # Europe Regions
+        europe-west1-b, europe-west1-c,
+        europe-west2-a, europe-west2-b,
+        europe-west3-a, europe-west3-b,
+        europe-west4-a, europe-west4-b, europe-west4-c,
+        # Asia Regions
+        asia-east1-a, asia-east1-b, asia-east1-c,
+        asia-northeast1-a, asia-northeast1-b, asia-northeast1-c,
+        asia-southeast1-a, asia-southeast1-b, asia-southeast1-c
+      ]
     # TODO: ALTERNATIVE — run Ubuntu tasks in a local Docker container instead:
     #   provider: docker
     #   image: ale-ubuntu22-docker          # container ref + port (8000) come from the Image entry
@@ -68,9 +85,26 @@ snapshots:
       project: ${env:GCP_PROJECT}
       service_account_key: ${env:GCP_SA_KEY}
       instance_prefix: ale
-      network: ale-vpc
-      subnet: ale-vpc
-      zones: [us-central1-a, us-central1-b, us-east1-b]
+      network: default
+      subnet: default
+      zones: [
+        # US Regions
+        us-central1-a, us-central1-b, us-central1-c,
+        us-east1-b, us-east1-c, us-east1-d,
+        us-east4-a, us-east4-c,
+        us-east7-b,
+        us-west1-a, us-west1-b, us-west1-c,
+        us-west4-a, us-west4-c,
+        # Europe Regions
+        europe-west1-b, europe-west1-c,
+        europe-west2-a, europe-west2-b,
+        europe-west3-a, europe-west3-b,
+        europe-west4-a, europe-west4-b, europe-west4-c,
+        # Asia Regions
+        asia-east1-a, asia-east1-b, asia-east1-c,
+        asia-northeast1-a, asia-northeast1-b, asia-northeast1-c,
+        asia-southeast1-a, asia-southeast1-b, asia-southeast1-c
+      ]
 
   cpu-license:                # Windows requiring a licensed image
     provider: gcloud
@@ -80,9 +114,26 @@ snapshots:
       project: ${env:GCP_PROJECT}
       service_account_key: ${env:GCP_SA_KEY}
       instance_prefix: ale
-      network: ale-vpc
-      subnet: ale-vpc
-      zones: [us-east1-b, us-central1-a]
+      network: default
+      subnet: default
+      zones: [
+        # US Regions
+        us-central1-a, us-central1-b, us-central1-c,
+        us-east1-b, us-east1-c, us-east1-d,
+        us-east4-a, us-east4-c,
+        us-east7-b,
+        us-west1-a, us-west1-b, us-west1-c,
+        us-west4-a, us-west4-c,
+        # Europe Regions
+        europe-west1-b, europe-west1-c,
+        europe-west2-a, europe-west2-b,
+        europe-west3-a, europe-west3-b,
+        europe-west4-a, europe-west4-b, europe-west4-c,
+        # Asia Regions
+        asia-east1-a, asia-east1-b, asia-east1-c,
+        asia-northeast1-a, asia-northeast1-b, asia-northeast1-c,
+        asia-southeast1-a, asia-southeast1-b, asia-southeast1-c
+      ]
 
   gpu-free:                   # Windows + GPU
     provider: gcloud
@@ -92,13 +143,29 @@ snapshots:
       project: ${env:GCP_PROJECT}
       service_account_key: ${env:GCP_SA_KEY}
       instance_prefix: ale
-      network: ale-vpc
-      subnet: ale-vpc
+      network: default
+      subnet: default
       gpu: nvidia-l4-vws
-      # GPU (nvidia-l4-vws) fallback zones, US-first. L4 capacity is volatile
-      # and often exhausted in a single region; gcloud tries these in order and
-      # skips capacity-exhausted zones, so list several across regions.
-      zones: [us-east1-c, us-central1-a, us-central1-b, us-east1-b, us-east4-a, northamerica-northeast2-a, northamerica-northeast1-c, europe-west1-b, europe-west2-b, asia-east1-a]
+      # GPU (nvidia-l4-vws) fallback zones (31 verified hardware zones across 13 regions).
+      # Ordered US-first, Europe-second, Asia-third:
+      zones: [
+        # US Regions (14 zones)
+        us-central1-a, us-central1-b, us-central1-c,
+        us-east1-b, us-east1-c, us-east1-d,
+        us-east4-a, us-east4-c,
+        us-east7-b,
+        us-west1-a, us-west1-b, us-west1-c,
+        us-west4-a, us-west4-c,
+        # Europe Regions (9 zones)
+        europe-west1-b, europe-west1-c,
+        europe-west2-a, europe-west2-b,
+        europe-west3-a, europe-west3-b,
+        europe-west4-a, europe-west4-b, europe-west4-c,
+        # Asia Regions (8 zones)
+        asia-east1-a, asia-east1-b, asia-east1-c,
+        asia-northeast1-a, asia-northeast1-b, asia-northeast1-c,
+        asia-southeast1-a, asia-southeast1-b, asia-southeast1-c
+      ]
 
   gpu-license:                # Windows + GPU, licensed
     provider: gcloud
@@ -108,13 +175,29 @@ snapshots:
       project: ${env:GCP_PROJECT}
       service_account_key: ${env:GCP_SA_KEY}
       instance_prefix: ale
-      network: ale-vpc
-      subnet: ale-vpc
+      network: default
+      subnet: default
       gpu: nvidia-l4-vws
-      # GPU (nvidia-l4-vws) fallback zones, US-first. L4 capacity is volatile
-      # and often exhausted in a single region; gcloud tries these in order and
-      # skips capacity-exhausted zones, so list several across regions.
-      zones: [us-east1-c, us-central1-a, us-central1-b, us-east1-b, us-east4-a, northamerica-northeast2-a, northamerica-northeast1-c, europe-west1-b, europe-west2-b, asia-east1-a]
+      # GPU (nvidia-l4-vws) fallback zones (31 verified hardware zones across 13 regions).
+      # Ordered US-first, Europe-second, Asia-third:
+      zones: [
+        # US Regions (14 zones)
+        us-central1-a, us-central1-b, us-central1-c,
+        us-east1-b, us-east1-c, us-east1-d,
+        us-east4-a, us-east4-c,
+        us-east7-b,
+        us-west1-a, us-west1-b, us-west1-c,
+        us-west4-a, us-west4-c,
+        # Europe Regions (9 zones)
+        europe-west1-b, europe-west1-c,
+        europe-west2-a, europe-west2-b,
+        europe-west3-a, europe-west3-b,
+        europe-west4-a, europe-west4-b, europe-west4-c,
+        # Asia Regions (8 zones)
+        asia-east1-a, asia-east1-b, asia-east1-c,
+        asia-northeast1-a, asia-northeast1-b, asia-northeast1-c,
+        asia-southeast1-a, asia-southeast1-b, asia-southeast1-c
+      ]
 
 # ---------------------------------------------------------------------------
 # Task data + output (substrate-coupled: code lives under ale_run/environments/).
