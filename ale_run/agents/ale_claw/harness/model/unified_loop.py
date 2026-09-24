@@ -527,7 +527,57 @@ def _convert_response_to_output(response: Any) -> Dict[str, Any]:
 # Unified agent loop
 # ---------------------------------------------------------------------------
 
-@register_agent(models=r"(openrouter/.*|openai/(?:responses/)?gpt-5\.5|openai/gemini-.*|gemini/.*)", priority=10)
+def _ensure_tool_call_pairing(msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Ensure every assistant tool_call_id has a matching tool message."""
+    final_msgs = []
+    pending_tool_call_ids = []
+    for m in msgs:
+        is_msg_dict = isinstance(m, dict)
+        role = m.get("role") if is_msg_dict else getattr(m, "role", None)
+        if role == "assistant":
+            for tid in pending_tool_call_ids:
+                final_msgs.append({
+                    "role": "tool",
+                    "tool_call_id": tid,
+                    "content": "Tool executed successfully but observation was omitted by harness.",
+                })
+            pending_tool_call_ids = []
+            tool_calls = m.get("tool_calls") if is_msg_dict else getattr(m, "tool_calls", None)
+            if tool_calls:
+                for tc in tool_calls:
+                    is_tc_dict = isinstance(tc, dict)
+                    tid = tc.get("id") if is_tc_dict else getattr(tc, "id", None)
+                    if tid:
+                        pending_tool_call_ids.append(tid)
+        elif role in ("tool", "function"):
+            tid = m.get("tool_call_id") if is_msg_dict else getattr(m, "tool_call_id", None)
+            if not tid and pending_tool_call_ids:
+                tid = pending_tool_call_ids[0]
+                if is_msg_dict:
+                    m["tool_call_id"] = tid
+                else:
+                    setattr(m, "tool_call_id", tid)
+            if tid in pending_tool_call_ids:
+                pending_tool_call_ids.remove(tid)
+        elif role == "user":
+            for tid in pending_tool_call_ids:
+                final_msgs.append({
+                    "role": "tool",
+                    "tool_call_id": tid,
+                    "content": "Tool executed successfully but observation was omitted by harness.",
+                })
+            pending_tool_call_ids = []
+        final_msgs.append(m)
+    for tid in pending_tool_call_ids:
+        final_msgs.append({
+            "role": "tool",
+            "tool_call_id": tid,
+            "content": "Tool executed successfully but observation was omitted by harness.",
+        })
+    return final_msgs
+
+
+@register_agent(models=r"(openrouter/.*|openai/.*|gemini/.*|anthropic/.*|claude-.*)", priority=10)
 class UnifiedAgentConfig(AsyncAgentConfig):
     """Unified agent loop for OpenRouter — all providers via acompletion().
 
@@ -558,7 +608,7 @@ class UnifiedAgentConfig(AsyncAgentConfig):
         chat_tools = await _prepare_tools(tools)
 
         # Convert Responses API input → Chat Completions messages
-        chat_messages = _convert_input_to_messages(messages)
+        chat_messages = _ensure_tool_call_pairing(_convert_input_to_messages(messages))
 
         # Apply OpenClaw cache_control markers in-place. Must happen here
         # (not via a callback) because ``agent.py:_on_api_start`` passes
