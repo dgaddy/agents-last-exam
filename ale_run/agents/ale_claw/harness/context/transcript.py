@@ -109,12 +109,17 @@ def _reasoning_assistant_block(item: dict[str, Any]) -> dict[str, Any] | None:
 
 def _function_call_block(item: dict[str, Any]) -> dict[str, Any]:
     """An assistant ``function_call`` block from a function_call output item."""
-    return {
+    block: dict[str, Any] = {
         "type": "function_call",
         "id": item.get("call_id", ""),
         "name": item.get("name", ""),
         "arguments": item.get("arguments", ""),
     }
+    if item.get("provider_specific_fields"):
+        block["provider_specific_fields"] = item["provider_specific_fields"]
+    if item.get("extra_content"):
+        block["extra_content"] = item["extra_content"]
+    return block
 
 
 def _computer_call_block(item: dict[str, Any]) -> dict[str, Any]:
@@ -127,6 +132,10 @@ def _computer_call_block(item: dict[str, Any]) -> dict[str, Any]:
         block["actions"] = item["actions"]
     else:
         block["action"] = item.get("action", {})
+    if item.get("provider_specific_fields"):
+        block["provider_specific_fields"] = item["provider_specific_fields"]
+    if item.get("extra_content"):
+        block["extra_content"] = item["extra_content"]
     return block
 
 

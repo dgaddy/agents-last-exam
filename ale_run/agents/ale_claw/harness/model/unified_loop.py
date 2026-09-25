@@ -280,14 +280,19 @@ def _append_assistant_role(
                 text_parts.append(c.get("text", ""))
             elif ctype == "tool_use":
                 # Canonical format: tool_use block inside assistant content
-                tool_calls.append({
+                tc_entry: Dict[str, Any] = {
                     "id": c.get("id", FALLBACK_CALL_ID),
                     "type": "function",
                     "function": {
                         "name": c.get("name", ""),
                         "arguments": json.dumps(c.get("input", {})),
                     },
-                })
+                }
+                if c.get("provider_specific_fields"):
+                    tc_entry["provider_specific_fields"] = c["provider_specific_fields"]
+                if c.get("extra_content"):
+                    tc_entry["extra_content"] = c["extra_content"]
+                tool_calls.append(tc_entry)
                 call_id_to_fn_name[c.get("id", FALLBACK_CALL_ID)] = c.get("name", "")
             elif ctype == "thinking":
                 # Thinking block — skip (not needed for replay)
@@ -382,14 +387,19 @@ def _append_computer_call(
     call_id_to_fn_name[call_id] = "computer"
     # Convert to function_call format
     args = dict(action)
-    _append_tool_call(messages, {
+    tc_dict: Dict[str, Any] = {
         "id": call_id,
         "type": "function",
         "function": {
             "name": "computer",
             "arguments": json.dumps(args),
         },
-    })
+    }
+    if item.get("provider_specific_fields"):
+        tc_dict["provider_specific_fields"] = item["provider_specific_fields"]
+    if item.get("extra_content"):
+        tc_dict["extra_content"] = item["extra_content"]
+    _append_tool_call(messages, tc_dict)
 
 
 def _append_computer_call_output(
@@ -515,6 +525,8 @@ def _convert_response_to_output(response: Any) -> Dict[str, Any]:
             })
 
     # --- Extract tool calls → function_call items ---
+    import builtins as _builtins
+    sig_cache = getattr(_builtins, "_thought_sig_cache", {})
     tool_calls = message.tool_calls
     if tool_calls:
         for tc in tool_calls:
@@ -527,6 +539,11 @@ def _convert_response_to_output(response: Any) -> Dict[str, Any]:
             psf = getattr(tc, "provider_specific_fields", None)
             if not psf and isinstance(tc, dict):
                 psf = tc.get("provider_specific_fields")
+            if not psf and tc.id and tc.id in sig_cache:
+                psf = {"thought_signature": sig_cache[tc.id]}
+            elif isinstance(psf, dict) and "thought_signature" not in psf and tc.id and tc.id in sig_cache:
+                psf = dict(psf)
+                psf["thought_signature"] = sig_cache[tc.id]
             if psf:
                 fc_item["provider_specific_fields"] = psf
             ec = getattr(tc, "extra_content", None)
