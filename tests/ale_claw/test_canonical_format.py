@@ -1245,3 +1245,45 @@ class TestCompactionImageRoundTrip:
         result = _strip_images_from_messages(messages)
         assert result[0] is messages[0]
         assert result[1] is messages[1]
+
+    def test_anthropic_tool_use_and_tool_result_round_trip(self):
+        """Post-compaction Anthropic wire-format tool_use and tool_result blocks survive sanitize_items."""
+        compacted_messages = [
+            {"role": "user", "content": [{"type": "text", "text": "Task prompt"}]},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "call_1",
+                        "name": "exec",
+                        "input": {"command": "ls -la"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call_1",
+                        "content": "file1.txt\nfile2.txt",
+                    }
+                ],
+            },
+        ]
+        res = sanitize_items(
+            normalize_to_canonical(compacted_messages),
+            target="anthropic",
+            model="gemini/gemini-3.1-pro",
+        )
+        assert res[1]["role"] == "assistant"
+        assert res[1]["content"][0]["type"] == "tool_use"
+        assert res[1]["content"][0]["id"] == "call_1"
+        assert res[1]["content"][0]["name"] == "exec"
+        assert res[1]["content"][0]["input"] == {"command": "ls -la"}
+        assert res[2]["role"] == "user"
+        assert res[2]["content"][0]["type"] == "tool_result"
+        assert res[2]["content"][0]["tool_use_id"] == "call_1"
+        assert res[2]["content"][0]["content"] == "file1.txt\nfile2.txt"
+

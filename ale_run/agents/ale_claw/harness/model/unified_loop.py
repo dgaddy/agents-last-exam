@@ -343,11 +343,16 @@ def _append_function_call(
     fn_args = item.get("arguments", "{}")
     call_id = item.get("call_id", FALLBACK_CALL_ID)
     call_id_to_fn_name[call_id] = fn_name
-    _append_tool_call(messages, {
+    tc_dict: Dict[str, Any] = {
         "id": call_id,
         "type": "function",
         "function": {"name": fn_name, "arguments": fn_args},
-    })
+    }
+    if item.get("provider_specific_fields"):
+        tc_dict["provider_specific_fields"] = item["provider_specific_fields"]
+    if item.get("extra_content"):
+        tc_dict["extra_content"] = item["extra_content"]
+    _append_tool_call(messages, tc_dict)
 
 
 def _append_function_call_output(
@@ -513,12 +518,23 @@ def _convert_response_to_output(response: Any) -> Dict[str, Any]:
     tool_calls = message.tool_calls
     if tool_calls:
         for tc in tool_calls:
-            output_items.append({
+            fc_item: Dict[str, Any] = {
                 "type": "function_call",
                 "call_id": tc.id,
                 "name": tc.function.name,
                 "arguments": tc.function.arguments,
-            })
+            }
+            psf = getattr(tc, "provider_specific_fields", None)
+            if not psf and isinstance(tc, dict):
+                psf = tc.get("provider_specific_fields")
+            if psf:
+                fc_item["provider_specific_fields"] = psf
+            ec = getattr(tc, "extra_content", None)
+            if not ec and isinstance(tc, dict):
+                ec = tc.get("extra_content")
+            if ec:
+                fc_item["extra_content"] = ec
+            output_items.append(fc_item)
 
     # --- Usage ---
     usage: Dict[str, Any] = {}
@@ -537,7 +553,26 @@ def _convert_response_to_output(response: Any) -> Dict[str, Any]:
     if hasattr(response, "_hidden_params"):
         usage["response_cost"] = response._hidden_params.get("response_cost", 0.0)
 
-    return {"output": output_items, "usage": usage}
+    import builtins as _builtins
+    import threading as _threading
+    finish_reason = (getattr(choice, "finish_reason", None) or "").lower()
+    malformed_msg = getattr(_builtins, "_malformed_fc_cache", {}).pop(
+        _threading.get_ident(), None
+    )
+    is_malformed = (
+        finish_reason == "malformed_function_call" or malformed_msg is not None
+    )
+    res_dict: Dict[str, Any] = {
+        "output": output_items,
+        "usage": usage,
+        "finish_reason": (
+            "malformed_function_call" if is_malformed else finish_reason
+        ),
+        "malformed_tool_call": is_malformed,
+    }
+    if malformed_msg:
+        res_dict["malformed_finish_message"] = malformed_msg
+    return res_dict
 
 
 # ---------------------------------------------------------------------------

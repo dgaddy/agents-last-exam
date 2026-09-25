@@ -197,11 +197,32 @@ def normalize_to_canonical(
             role = msg.get("role", "user")
             content = msg.get("content", "")
             blocks = _normalize_content(content, role)
-            canonical: CanonicalMessage = {"role": role, "content": blocks}
-            stop_reason = msg.get("stop_reason")
-            if stop_reason:
-                canonical["stop_reason"] = stop_reason
-            result.append(canonical)
+            if role == "user" and any(
+                b.get("type") == "tool_result" for b in blocks
+            ):
+                tool_blocks = [
+                    b for b in blocks if b.get("type") == "tool_result"
+                ]
+                other_blocks = [
+                    b for b in blocks if b.get("type") != "tool_result"
+                ]
+                if tool_blocks:
+                    result.append({"role": "tool", "content": tool_blocks})
+                if other_blocks:
+                    canonical_user: CanonicalMessage = {
+                        "role": role,
+                        "content": other_blocks,
+                    }
+                    stop_reason = msg.get("stop_reason")
+                    if stop_reason:
+                        canonical_user["stop_reason"] = stop_reason
+                    result.append(canonical_user)
+            else:
+                canonical: CanonicalMessage = {"role": role, "content": blocks}
+                stop_reason = msg.get("stop_reason")
+                if stop_reason:
+                    canonical["stop_reason"] = stop_reason
+                result.append(canonical)
     return result
 
 
@@ -378,6 +399,31 @@ def _normalize_content(
                 name=block.get("name", ""),
                 arguments=block.get("arguments", ""),
             ))
+
+        elif btype == "tool_use":
+            inp = block.get("input", {})
+            name = block.get("name", "")
+            if name == "computer" and isinstance(inp, dict) and (
+                "actions" in inp or "action" in inp
+            ):
+                actions = inp.get("actions") or [inp]
+                blocks.append(ComputerCallBlock(
+                    type="computer_call",
+                    id=block.get("id", ""),
+                    actions=actions,
+                ))
+            else:
+                args_str = (
+                    json.dumps(inp)
+                    if isinstance(inp, (dict, list))
+                    else str(inp)
+                )
+                blocks.append(FunctionCallBlock(
+                    type="function_call",
+                    id=block.get("id", ""),
+                    name=name,
+                    arguments=args_str,
+                ))
 
         elif btype == "computer_call":
             blocks.append(ComputerCallBlock(
@@ -797,6 +843,15 @@ def canonical_to_anthropic_messages(
                         "type": "text",
                         "text": COMPACTION_PREAMBLE + block["text"],
                     })
+                elif btype == "tool_result":
+                    tr_user: dict[str, Any] = {
+                        "type": "tool_result",
+                        "tool_use_id": block["tool_use_id"],
+                        "content": block["content"],
+                    }
+                    if block.get("is_error"):
+                        tr_user["is_error"] = True
+                    content_out.append(tr_user)
                 else:
                     content_out.append({"type": "text", "text": str(block)})
             if content_out:

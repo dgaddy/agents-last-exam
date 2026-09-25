@@ -417,11 +417,43 @@ class OpenClawComputerAgent(ComputerAgent):
             item.get("type") in ("function_call", "computer_call")
             for item in output_items
         )
+        is_malformed = bool(
+            result.get("malformed_tool_call")
+            or result.get("finish_reason") == "malformed_function_call"
+        )
         if not has_tool_call:
+            if is_malformed:
+                finish_msg = (
+                    result.get("malformed_finish_message")
+                    or "Malformed function call: Failed to parse function call."
+                )
+                nudge_text = (
+                    f"[Tool Call Error] Your previous tool call was malformed "
+                    f"and could not be parsed "
+                    f"(finishReason=MALFORMED_FUNCTION_CALL: {finish_msg}). "
+                    f"Because it could not be parsed, no tool was executed. "
+                    f"Please retry by emitting a properly formatted tool call."
+                )
+            else:
+                nudge_text = (
+                    "Please continue: emit your next tool call to make "
+                    "progress, or output the DONE marker if the task is "
+                    "complete."
+                )
+            new_items.append({"role": "user", "content": nudge_text})
+            self.session_mgr.append_message("user", nudge_text)
+        elif is_malformed:
+            finish_msg = (
+                result.get("malformed_finish_message")
+                or "Malformed function call: Failed to parse function call."
+            )
             nudge_text = (
-                "Please continue: emit your next tool call to make "
-                "progress, or output the DONE marker if the task is "
-                "complete."
+                f"[Tool Call Error] A tool call in your previous response was "
+                f"malformed and could not be parsed "
+                f"(finishReason=MALFORMED_FUNCTION_CALL: {finish_msg}). "
+                f"Only the validly parsed tool calls above were executed; the "
+                f"malformed tool call was not executed. Please re-issue the "
+                f"unexecuted tool call using valid tool-call formatting."
             )
             new_items.append({"role": "user", "content": nudge_text})
             self.session_mgr.append_message("user", nudge_text)
