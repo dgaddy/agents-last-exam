@@ -294,15 +294,30 @@ def _append_assistant_role(
                 pass
         msg: Dict[str, Any] = {"role": "assistant"}
         msg["content"] = "\n".join(text_parts) if text_parts else None
+        thinking_parts = [
+            c.get("thinking") or c.get("text") or ""
+            for c in content
+            if isinstance(c, dict) and c.get("type") == "thinking"
+        ]
+        if any(thinking_parts):
+            msg["reasoning_content"] = "\n".join(p for p in thinking_parts if p)
         if tool_calls:
             msg["tool_calls"] = tool_calls
-        messages.append(msg)
+        if (
+            messages
+            and messages[-1].get("role") == "assistant"
+            and messages[-1].get("content") is None
+            and not messages[-1].get("tool_calls")
+        ):
+            messages[-1].update(msg)
+        else:
+            messages.append(msg)
     else:
         messages.append({"role": "assistant", "content": None})
 
 
 def _append_reasoning(item: Dict[str, Any], messages: List[Dict[str, Any]]) -> None:
-    """Convert a prior-turn ``reasoning`` item into an assistant text message."""
+    """Convert a prior-turn ``reasoning`` item into an assistant reasoning_content field."""
     summary = item.get("summary", [])
     text = ""
     if isinstance(summary, list):
@@ -313,7 +328,9 @@ def _append_reasoning(item: Dict[str, Any], messages: List[Dict[str, Any]]) -> N
     if not text:
         text = item.get("reasoning", "")
     if text:
-        messages.append({"role": "assistant", "content": text})
+        messages.append(
+            {"role": "assistant", "content": None, "reasoning_content": text}
+        )
 
 
 def _append_function_call(
