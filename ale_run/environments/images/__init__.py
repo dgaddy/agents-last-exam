@@ -106,23 +106,54 @@ from .ale_win10 import IMAGE as _ALE_WIN10
 from .ale_win_server import IMAGE as _ALE_WIN_SERVER
 
 
+from dataclasses import replace as _replace_image
+
 _REGISTRY: dict[str, Image] = {
     _ALE_KASM.name: _ALE_KASM,
     _ALE_UBUNTU22.name: _ALE_UBUNTU22,
     _ALE_UBUNTU22_DOCKER.name: _ALE_UBUNTU22_DOCKER,
     _ALE_WIN10.name: _ALE_WIN10,
     _ALE_WIN_SERVER.name: _ALE_WIN_SERVER,
+    "ale-license-cpu-probe-clean-candidate-20260916": _replace_image(
+        _ALE_WIN10, name="ale-license-cpu-probe-clean-candidate-20260916"
+    ),
+    "ale-win10-cpu-licensed": _replace_image(
+        _ALE_WIN10, name="ale-win10-cpu-licensed"
+    ),
+    "ale-win10-gpu-licensed": _replace_image(
+        _ALE_WIN10,
+        name="ale-win10-gpu-licensed",
+        default_machine_type="g2-standard-8",
+        gpu="nvidia-l4",
+    ),
+    "ale-win10-v1-1": _replace_image(_ALE_WIN10, name="ale-win10-v1-1"),
+    "ale-ubuntu22-v1-1": _replace_image(
+        _ALE_UBUNTU22, name="ale-ubuntu22-v1-1"
+    ),
+    "ale-ubuntu22-v1-1-r02": _replace_image(
+        _ALE_UBUNTU22, name="ale-ubuntu22-v1-1-r02"
+    ),
+    "ale-winserver2022-inventor-20260806": _replace_image(
+        _ALE_WIN_SERVER, name="ale-winserver2022-inventor-20260806"
+    ),
 }
 
 
 def get(name: str) -> Image:
-    """Look up an image family by name. Raise on unknown."""
-    if name not in _REGISTRY:
-        raise KeyError(
-            f"unknown image family {name!r}; "
-            f"registered: {sorted(_REGISTRY)}"
-        )
-    return _REGISTRY[name]
+    """Look up an image family by name, falling back to base OS family."""
+    if name in _REGISTRY:
+        return _REGISTRY[name]
+    lower = name.lower()
+    if "winserver" in lower or "win-server" in lower:
+        return _replace_image(_ALE_WIN_SERVER, name=name)
+    if "ubuntu" in lower:
+        return _replace_image(_ALE_UBUNTU22, name=name)
+    if "win" in lower or "license" in lower:
+        return _replace_image(_ALE_WIN10, name=name)
+    raise KeyError(
+        f"unknown image family {name!r}; "
+        f"registered: {sorted(_REGISTRY)}"
+    )
 
 
 def registered() -> list[str]:

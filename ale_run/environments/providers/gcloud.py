@@ -22,6 +22,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import random
 import re
 import time
@@ -296,7 +297,10 @@ class SnapshotConfig:
 
     @property
     def os(self) -> str:
-        return "windows" if "win" in self.image.lower() else "linux"
+        lower = self.image.lower()
+        if "ubuntu" in lower or "kasm" in lower or "linux" in lower:
+            return "linux"
+        return "windows" if ("win" in lower or "license" in lower) else "linux"
 
 
 @dataclass(frozen=True)
@@ -491,7 +495,7 @@ def _build_create_args(
         f"--zone={zone}",
         f"--machine-type={machine_type}",
         f"--image={image}",
-        f"--image-project={project}",
+        f"--image-project={os.environ.get('ALE_IMAGE_PROJECT', 'lc5ecafd9243a819a-tp') if image not in ('ale-ubuntu22', 'ale-win10', 'ale-kasm', 'ale-ubuntu22-docker', 'ale-win-server') else project}",
         f"--boot-disk-type={boot_disk_type}",
         f"--network={network}",
         f"--subnet={subnet}",
