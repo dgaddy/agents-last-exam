@@ -27,6 +27,7 @@ import litellm
 from agent.tools.base import BaseTool, register_tool
 
 from ..model.image_sanitization import ImageLimits, sanitize_raw_image_bytes
+from ..model.model_config import call_with_retry_budget
 
 if TYPE_CHECKING:
     from computer.interface import BaseComputerInterface
@@ -336,12 +337,15 @@ class AnalyzeImageTool(BaseTool):
 
         # Call VLM
         try:
-            response = await litellm.acompletion(
-                model=self.model,
-                messages=messages,
-                max_tokens=1024,
-                timeout=60,
-                **self.thinking_params,
+            response = await call_with_retry_budget(
+                lambda: litellm.acompletion(
+                    model=self.model,
+                    messages=messages,
+                    max_tokens=1024,
+                    timeout=60,
+                    **self.thinking_params,
+                ),
+                label=f"analyze_image({self.model})",
             )
             return response.choices[0].message.content
         except Exception as e:

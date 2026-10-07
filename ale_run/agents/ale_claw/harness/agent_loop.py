@@ -31,12 +31,13 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
 from typing import Any, AsyncGenerator, Callable, Dict, List, Optional
 
 from agent.agent import ComputerAgent, assert_callable_with, get_json, get_output_call_ids
 from agent.computers.base import AsyncComputerHandler
 from agent.computers.cua import cuaComputerHandler
-from .model.model_config import ResolvedModel
+from .model.model_config import ResolvedModel, call_with_retry_budget
 from agent.responses import make_tool_error_item, replace_failed_computer_calls_with_function_calls
 from agent.tools.base import BaseTool
 from agent.types import ToolError
@@ -127,6 +128,8 @@ class OpenClawComputerAgent(ComputerAgent):
         if overflow_cb not in callbacks:
             callbacks = [overflow_cb] + list(callbacks)
         kwargs["callbacks"] = callbacks
+        if "max_retries" not in kwargs or kwargs["max_retries"] is None:
+            kwargs["max_retries"] = int(os.environ.get("LITELLM_MAX_RETRIES", "1000"))
 
         super().__init__(**kwargs)
 
@@ -253,14 +256,17 @@ class OpenClawComputerAgent(ComputerAgent):
                 **merged_kwargs,
             }
 
-            # === REACTIVE OVERFLOW: try/except around predict_step ===
+            # === REACTIVE OVERFLOW & 24H TRANSIENT RETRY: around predict_step ===
             try:
-                result = await self.agent_loop.predict_step(
-                    **loop_kwargs,
-                    _on_api_start=self._on_api_start,
-                    _on_api_end=self._on_api_end,
-                    _on_usage=self._on_usage,
-                    _on_screenshot=self._on_screenshot,
+                result = await call_with_retry_budget(
+                    lambda: self.agent_loop.predict_step(
+                        **loop_kwargs,
+                        _on_api_start=self._on_api_start,
+                        _on_api_end=self._on_api_end,
+                        _on_usage=self._on_usage,
+                        _on_screenshot=self._on_screenshot,
+                    ),
+                    label=f"agent_loop.predict_step({self.model})",
                 )
             except Exception as e:
                 if (
