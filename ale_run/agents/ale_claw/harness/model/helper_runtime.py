@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json as _json
+import os
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from .model_config import ResolvedModel, resolve_model
+from .model_config import ResolvedModel, call_with_retry_budget, resolve_model
 
 
 @dataclass(frozen=True)
@@ -44,7 +45,10 @@ async def call_helper_model(
             kwargs["timeout"] = timeout
         if tools:
             kwargs["tools"] = [_to_responses_function_tool(tool) for tool in tools]
-        response = await litellm.aresponses(**kwargs)
+        response = await call_with_retry_budget(
+            lambda: litellm.aresponses(**kwargs),
+            label=f"helper:{purpose}({resolved.model})",
+        )
         payload = response.model_dump()
         return HelperCallResult(
             text=_extract_responses_text(payload.get("output", [])),
@@ -62,7 +66,10 @@ async def call_helper_model(
         kwargs["timeout"] = timeout
     if tools:
         kwargs["tools"] = tools
-    response = await litellm.acompletion(**kwargs)
+    response = await call_with_retry_budget(
+        lambda: litellm.acompletion(**kwargs),
+        label=f"helper:{purpose}({resolved.model})",
+    )
     choice = response.choices[0]
     return HelperCallResult(
         text=(choice.message.content or "").strip(),

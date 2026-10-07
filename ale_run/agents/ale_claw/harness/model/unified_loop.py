@@ -30,6 +30,7 @@ from agent.types import AgentCapability, Messages, Tools
 
 from ._message_shapes import _image_url_block
 from .cache_policy import apply_openclaw_cache_markers
+from .model_config import call_with_retry_budget
 
 
 # Fallback call_id when a tool/computer call item arrives without an id/call_id.
@@ -689,13 +690,18 @@ class UnifiedAgentConfig(AsyncAgentConfig):
         if use_prompt_caching:
             apply_openclaw_cache_markers(chat_messages, model)
 
-        # Build API kwargs
+        # Build API kwargs. Note: CUA's ComputerAgent defaults max_retries to 3,
+        # so treat 3 as unset when resolving LITELLM_MAX_RETRIES.
+        default_retries = int(os.environ.get("LITELLM_MAX_RETRIES", "1000"))
+        effective_retries = (
+            default_retries if max_retries in (None, 3) else max_retries
+        )
         api_kwargs: Dict[str, Any] = {
             "model": model,
             "messages": chat_messages,
             "tools": chat_tools if chat_tools else None,
             "stream": stream,
-            "num_retries": max_retries,
+            "num_retries": effective_retries,
         }
 
         # Merge generation kwargs (thinking, api_key, etc.)
@@ -705,16 +711,19 @@ class UnifiedAgentConfig(AsyncAgentConfig):
                 api_kwargs[k] = v
 
         if "timeout" not in api_kwargs or api_kwargs["timeout"] is None:
-            api_kwargs["timeout"] = float(os.environ.get("LITELLM_REQUEST_TIMEOUT", "18000.0"))
+            api_kwargs["timeout"] = float(os.environ.get("LITELLM_REQUEST_TIMEOUT", "600.0"))
         if "num_retries" not in api_kwargs or api_kwargs["num_retries"] is None:
-            api_kwargs["num_retries"] = int(os.environ.get("LITELLM_MAX_RETRIES", "100"))
+            api_kwargs["num_retries"] = default_retries
 
         # Call API start hook
         if _on_api_start:
             await _on_api_start(api_kwargs)
 
-        # Call OpenRouter via litellm
-        response = await litellm.acompletion(**api_kwargs)
+        # Call OpenRouter / provider via litellm with 24h retry budget
+        response = await call_with_retry_budget(
+            lambda: litellm.acompletion(**api_kwargs),
+            label=f"predict_step({model})",
+        )
 
         # Call API end hook
         if _on_api_end:
@@ -784,13 +793,18 @@ class UnifiedAgentConfig(AsyncAgentConfig):
             "tools": [click_tool],
             "stream": False,
             "max_tokens": 200,
+            "timeout": float(os.environ.get("LITELLM_REQUEST_TIMEOUT", "600.0")),
+            "num_retries": int(os.environ.get("LITELLM_MAX_RETRIES", "1000")),
         }
         # Pass through api_key/api_base if provided
         for k in ("api_key", "api_base"):
             if k in kwargs and kwargs[k] is not None:
                 api_kwargs[k] = kwargs[k]
 
-        response = await litellm.acompletion(**api_kwargs)
+        response = await call_with_retry_budget(
+            lambda: litellm.acompletion(**api_kwargs),
+            label=f"predict_click({model})",
+        )
         result = _convert_response_to_output(response)
 
         for item in result.get("output", []):

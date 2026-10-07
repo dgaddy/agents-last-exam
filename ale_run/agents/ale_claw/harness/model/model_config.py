@@ -12,16 +12,188 @@ Design reference:
 
 from __future__ import annotations
 
+import asyncio
 import os
+import random
 import re
+import time
 from dataclasses import dataclass
-from typing import List, Literal, Tuple
+from typing import Any, Awaitable, Callable, List, Literal, Tuple, TypeVar
 
 import litellm
 
 # Set LiteLLM global request timeout and max retries from environment variables
-litellm.request_timeout = float(os.environ.get("LITELLM_REQUEST_TIMEOUT", "18000.0"))
-litellm.num_retries = int(os.environ.get("LITELLM_MAX_RETRIES", "100"))
+litellm.request_timeout = float(os.environ.get("LITELLM_REQUEST_TIMEOUT", "600.0"))
+litellm.num_retries = int(os.environ.get("LITELLM_MAX_RETRIES", "1000"))
+
+DEFAULT_RETRY_BUDGET_S = 86400.0  # 24 hours
+
+_T = TypeVar("_T")
+
+# Patterns indicating context window overflow (must NOT be retried as transient
+# infra errors so that reactive context compaction can run immediately).
+_CONTEXT_OVERFLOW_PATTERNS: tuple[str, ...] = (
+    "context_length_exceeded",
+    "context length",
+    "maximum context length",
+    "prompt is too long",
+    "input is too long",
+    "request_too_large",
+    "exceeds the model's maximum context",
+    "exceeds the maximum number of tokens",
+    "context window",
+    "too many tokens",
+)
+
+# Substrings in exception messages or types that indicate a transient
+# infrastructure, overload, preemption, timeout, or network failure.
+_TRANSIENT_ERROR_PATTERNS: tuple[str, ...] = (
+    "timeout",
+    "timed out",
+    "sockettimeout",
+    "rate limit",
+    "ratelimit",
+    "too many requests",
+    "429",
+    "500",
+    "502",
+    "503",
+    "504",
+    "520",
+    "522",
+    "524",
+    "529",
+    "overloaded",
+    "preempted",
+    "resource_exhausted",
+    "service unavailable",
+    "unavailable",
+    "bad gateway",
+    "gateway timeout",
+    "internal server error",
+    "internal error",
+    "backend error",
+    "connection",
+    "disconnected",
+    "reset by peer",
+    "broken pipe",
+    "unexpected eof",
+    "eof occurred",
+    "server closed",
+    "remoteprotocolerror",
+    "clientoserror",
+    "clientpayloaderror",
+    "no healthy",
+    "try again",
+)
+
+_TRANSIENT_STATUS_CODES: frozenset[int] = frozenset(
+    {408, 429, 500, 502, 503, 504, 520, 522, 524, 529}
+)
+
+
+def get_retry_budget_s() -> float:
+    """Return the time budget in seconds for retrying transient LLM failures.
+
+    Defaults to 86400.0s (24 hours) in normal execution, or 0.0s inside pytest
+    unless ``LITELLM_RETRY_BUDGET_S`` is explicitly set in the environment.
+    """
+    env_val = os.environ.get("LITELLM_RETRY_BUDGET_S")
+    if env_val is not None:
+        return float(env_val)
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        return 0.0
+    return DEFAULT_RETRY_BUDGET_S
+
+
+def is_transient_llm_error(exc: BaseException) -> bool:
+    """Return True if *exc* is a transient infra/network/timeout/overload error."""
+    if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+        return False
+
+    msg_lower = f"{type(exc).__name__}: {exc}".lower()
+    if any(p in msg_lower for p in _CONTEXT_OVERFLOW_PATTERNS):
+        return False
+
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int):
+        if status_code in _TRANSIENT_STATUS_CODES:
+            return True
+        if 400 <= status_code < 500 and not any(
+            p in msg_lower for p in ("overloaded", "preempted", "resource_exhausted", "rate limit", "timeout", "timed out")
+        ):
+            return False
+
+    if isinstance(
+        exc,
+        (
+            TimeoutError,
+            asyncio.TimeoutError,
+            ConnectionError,
+            OSError,
+            litellm.Timeout,
+            litellm.RateLimitError,
+            litellm.InternalServerError,
+            litellm.ServiceUnavailableError,
+            litellm.APIConnectionError,
+        ),
+    ):
+        return True
+
+    bad_gw = getattr(litellm, "BadGatewayError", None)
+    gw_timeout = getattr(litellm, "GatewayTimeoutError", None)
+    extra_types = tuple(t for t in (bad_gw, gw_timeout) if isinstance(t, type))
+    if extra_types and isinstance(exc, extra_types):
+        return True
+
+    if any(p in msg_lower for p in _TRANSIENT_ERROR_PATTERNS):
+        return True
+
+    cause = exc.__cause__ or exc.__context__
+    if cause is not None and cause is not exc:
+        return is_transient_llm_error(cause)
+
+    return False
+
+
+async def call_with_retry_budget(
+    coro_fn: Callable[[], Awaitable[_T]],
+    *,
+    label: str = "LLM call",
+    budget_s: float | None = None,
+) -> _T:
+    """Execute *coro_fn* with exponential backoff for up to *budget_s* seconds on transient errors."""
+    effective_budget_s = get_retry_budget_s() if budget_s is None else budget_s
+    deadline = time.monotonic() + max(0.0, effective_budget_s)
+    attempt = 0
+
+    while True:
+        attempt += 1
+        try:
+            return await coro_fn()
+        except BaseException as exc:
+            if getattr(exc, "_retry_budget_exhausted", False):
+                raise
+            if not is_transient_llm_error(exc):
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                try:
+                    setattr(exc, "_retry_budget_exhausted", True)
+                except Exception:
+                    pass
+                raise
+            base_delay = min(60.0, 5.0 * (2 ** min(attempt - 1, 4)))
+            jitter = random.uniform(0.0, min(5.0, base_delay * 0.25))
+            sleep_s = min(remaining, base_delay + jitter)
+            print(
+                f"[RetryBudget] {label} failed on attempt {attempt} "
+                f"({type(exc).__name__}: {exc}). "
+                f"Retrying in {sleep_s:.1f}s (remaining budget: {remaining:.0f}s)...",
+                flush=True,
+            )
+            await asyncio.sleep(sleep_s)
+
 
 
 @dataclass(frozen=True)
