@@ -197,11 +197,32 @@ def normalize_to_canonical(
             role = msg.get("role", "user")
             content = msg.get("content", "")
             blocks = _normalize_content(content, role)
-            canonical: CanonicalMessage = {"role": role, "content": blocks}
-            stop_reason = msg.get("stop_reason")
-            if stop_reason:
-                canonical["stop_reason"] = stop_reason
-            result.append(canonical)
+            if role == "user" and any(
+                b.get("type") == "tool_result" for b in blocks
+            ):
+                tool_blocks = [
+                    b for b in blocks if b.get("type") == "tool_result"
+                ]
+                other_blocks = [
+                    b for b in blocks if b.get("type") != "tool_result"
+                ]
+                if tool_blocks:
+                    result.append({"role": "tool", "content": tool_blocks})
+                if other_blocks:
+                    canonical_user: CanonicalMessage = {
+                        "role": role,
+                        "content": other_blocks,
+                    }
+                    stop_reason = msg.get("stop_reason")
+                    if stop_reason:
+                        canonical_user["stop_reason"] = stop_reason
+                    result.append(canonical_user)
+            else:
+                canonical: CanonicalMessage = {"role": role, "content": blocks}
+                stop_reason = msg.get("stop_reason")
+                if stop_reason:
+                    canonical["stop_reason"] = stop_reason
+                result.append(canonical)
     return result
 
 
@@ -249,6 +270,10 @@ def _ingest_flat_item(
             name=item.get("name", ""),
             arguments=item.get("arguments", ""),
         )
+        if item.get("provider_specific_fields"):
+            block["provider_specific_fields"] = item["provider_specific_fields"]
+        if item.get("extra_content"):
+            block["extra_content"] = item["extra_content"]
         _append_or_merge(result, "assistant", [block])
         return
 
@@ -258,6 +283,10 @@ def _ingest_flat_item(
             id=item.get("call_id", item.get("id", "")),
             actions=_normalize_actions(item),
         )
+        if item.get("provider_specific_fields"):
+            block["provider_specific_fields"] = item["provider_specific_fields"]
+        if item.get("extra_content"):
+            block["extra_content"] = item["extra_content"]
         _append_or_merge(result, "assistant", [block])
         return
 
@@ -372,19 +401,64 @@ def _normalize_content(
             blocks.append(TextBlock(type="text", text=block.get("text", "")))
 
         elif btype == "function_call":
-            blocks.append(FunctionCallBlock(
+            fc_block = FunctionCallBlock(
                 type="function_call",
                 id=block.get("id", block.get("call_id", "")),
                 name=block.get("name", ""),
                 arguments=block.get("arguments", ""),
-            ))
+            )
+            if block.get("provider_specific_fields"):
+                fc_block["provider_specific_fields"] = block["provider_specific_fields"]
+            if block.get("extra_content"):
+                fc_block["extra_content"] = block["extra_content"]
+            blocks.append(fc_block)
+
+        elif btype == "tool_use":
+            inp = block.get("input", {})
+            name = block.get("name", "")
+            if name == "computer" and isinstance(inp, dict) and (
+                "actions" in inp or "action" in inp
+            ):
+                actions = inp.get("actions") or [inp]
+                cc_block = ComputerCallBlock(
+                    type="computer_call",
+                    id=block.get("id", ""),
+                    actions=actions,
+                )
+                if block.get("provider_specific_fields"):
+                    cc_block["provider_specific_fields"] = block["provider_specific_fields"]
+                if block.get("extra_content"):
+                    cc_block["extra_content"] = block["extra_content"]
+                blocks.append(cc_block)
+            else:
+                args_str = (
+                    json.dumps(inp)
+                    if isinstance(inp, (dict, list))
+                    else str(inp)
+                )
+                fc_tu_block = FunctionCallBlock(
+                    type="function_call",
+                    id=block.get("id", ""),
+                    name=name,
+                    arguments=args_str,
+                )
+                if block.get("provider_specific_fields"):
+                    fc_tu_block["provider_specific_fields"] = block["provider_specific_fields"]
+                if block.get("extra_content"):
+                    fc_tu_block["extra_content"] = block["extra_content"]
+                blocks.append(fc_tu_block)
 
         elif btype == "computer_call":
-            blocks.append(ComputerCallBlock(
+            cc_norm_block = ComputerCallBlock(
                 type="computer_call",
                 id=block.get("id", block.get("call_id", "")),
                 actions=_normalize_actions(block),
-            ))
+            )
+            if block.get("provider_specific_fields"):
+                cc_norm_block["provider_specific_fields"] = block["provider_specific_fields"]
+            if block.get("extra_content"):
+                cc_norm_block["extra_content"] = block["extra_content"]
+            blocks.append(cc_norm_block)
 
         elif btype == "tool_result":
             tb = ToolResultBlock(
@@ -499,12 +573,17 @@ def canonical_to_responses_api(
             elif btype == "function_call":
                 call_id = block["id"]
                 call_type_map[call_id] = "function_call"
-                items.append({
+                fc_out: dict[str, Any] = {
                     "type": "function_call",
                     "call_id": call_id,
                     "name": block["name"],
                     "arguments": block["arguments"],
-                })
+                }
+                if block.get("provider_specific_fields"):
+                    fc_out["provider_specific_fields"] = block["provider_specific_fields"]
+                if block.get("extra_content"):
+                    fc_out["extra_content"] = block["extra_content"]
+                items.append(fc_out)
 
             elif btype == "computer_call":
                 call_id = block["id"]
@@ -759,19 +838,29 @@ def canonical_to_anthropic_messages(
                                 "_partial_args": partial,
                                 "_original_length": len(raw_args) if isinstance(raw_args, str) else 0,
                             }
-                    content.append({
+                    tu_fc: dict[str, Any] = {
                         "type": "tool_use",
                         "id": block["id"],
                         "name": block["name"],
                         "input": tool_input,
-                    })
+                    }
+                    if block.get("provider_specific_fields"):
+                        tu_fc["provider_specific_fields"] = block["provider_specific_fields"]
+                    if block.get("extra_content"):
+                        tu_fc["extra_content"] = block["extra_content"]
+                    content.append(tu_fc)
                 elif btype == "computer_call":
-                    content.append({
+                    tu_cc: dict[str, Any] = {
                         "type": "tool_use",
                         "id": block["id"],
                         "name": "computer",
                         "input": {"actions": block["actions"]},
-                    })
+                    }
+                    if block.get("provider_specific_fields"):
+                        tu_cc["provider_specific_fields"] = block["provider_specific_fields"]
+                    if block.get("extra_content"):
+                        tu_cc["extra_content"] = block["extra_content"]
+                    content.append(tu_cc)
                 elif btype == "thinking":
                     tb: dict[str, Any] = {
                         "type": "thinking",
@@ -797,6 +886,15 @@ def canonical_to_anthropic_messages(
                         "type": "text",
                         "text": COMPACTION_PREAMBLE + block["text"],
                     })
+                elif btype == "tool_result":
+                    tr_user: dict[str, Any] = {
+                        "type": "tool_result",
+                        "tool_use_id": block["tool_use_id"],
+                        "content": block["content"],
+                    }
+                    if block.get("is_error"):
+                        tr_user["is_error"] = True
+                    content_out.append(tr_user)
                 else:
                     content_out.append({"type": "text", "text": str(block)})
             if content_out:

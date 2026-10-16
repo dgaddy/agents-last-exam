@@ -22,9 +22,9 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import random
 import re
-import shlex
 import time
 from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path
@@ -48,7 +48,7 @@ _DEFAULT_CPU_MACHINE = "c4-standard-8"
 _DEFAULT_GPU_MACHINE = "g2-standard-8"
 
 # VM-create retry tuning.
-_GCP_MAX_RETRIES_TRANSIENT = 3
+_GCP_MAX_RETRIES_TRANSIENT = 10
 _GCP_TRANSIENT_BASE_DELAY = 15          # seconds, exponential backoff
 _CUA_READY_STABLE_SUCCESSES = 2         # consecutive /status oks before "ready"
 
@@ -232,6 +232,32 @@ def _machine_chain(machine_type: str, *, is_gpu: bool) -> tuple[str, ...]:
 
 
 # ============================================================================
+# Zone load-balancing helper
+# ============================================================================
+
+
+def _shuffle_zones_by_region(zones: tuple[str, ...]) -> tuple[str, ...]:
+    """Shuffle zones within each geographic region tier to distribute load
+    evenly across candidate zones while preserving regional preference
+    (e.g. US -> Europe -> Asia)."""
+    if not zones:
+        return ()
+    groups: list[list[str]] = []
+    current_prefix = ""
+    for z in zones:
+        prefix = z.split("-")[0]
+        if not groups or prefix != current_prefix:
+            groups.append([z])
+            current_prefix = prefix
+        else:
+            groups[-1].append(z)
+    shuffled: list[str] = []
+    for grp in groups:
+        shuffled.extend(random.sample(grp, len(grp)))
+    return tuple(shuffled)
+
+
+# ============================================================================
 # Label sanitization
 # ============================================================================
 
@@ -257,7 +283,6 @@ class SnapshotConfig:
     image: str          # GCE image name (= framework Image-registry family)
     gpu: str | None     # accelerator type; None for CPU snapshots
     zones: tuple[str, ...]   # zones to try, in order, on capacity errors
-    boot_disk_size_gb: int | None = None
     resolution: tuple[int, int] | None = None
     """Windows display resolution (w, h) to force after the VM boots. None
     leaves the image/driver default. Applied in acquire() for Windows snapshots
@@ -269,12 +294,13 @@ class SnapshotConfig:
     to 1920x1440 (e.g. 1024x768, 1280x800, 1920x1080); GPU VMs (nvidia-l4-vws /
     GRID) are a superset up to 7680x4320. 1024x768 and 1920x1080 work on both.
     The operator-facing list lives in the environment yaml comment."""
-    image_revision: str | None = None
-    """Optional expected numeric sourceImageId of the acquired boot disk."""
 
     @property
     def os(self) -> str:
-        return "windows" if "win" in self.image.lower() else "linux"
+        lower = self.image.lower()
+        if "ubuntu" in lower or "kasm" in lower or "linux" in lower:
+            return "linux"
+        return "windows" if ("win" in lower or "license" in lower) else "linux"
 
 
 @dataclass(frozen=True)
@@ -313,23 +339,9 @@ def _build_snapshot_config(raw: Any) -> SnapshotConfig:
     zones = tuple(raw.get("zones") or ())
     if not zones:
         raise KeyError(f"snapshot {image!r} missing required `zones`")
-    boot_disk_size_gb = raw.get("boot_disk_size_gb")
-    if boot_disk_size_gb is not None:
-        boot_disk_size_gb = int(boot_disk_size_gb)
-        if boot_disk_size_gb <= 0:
-            raise ValueError(
-                f"snapshot {image!r} boot_disk_size_gb must be positive"
-            )
-    image_revision = raw.get("image_revision")
-    if image_revision is not None:
-        image_revision = str(image_revision).strip() or None
-    if image_revision is not None and not re.fullmatch(r"[1-9][0-9]*", image_revision):
-        raise ValueError("gcloud image_revision must be a numeric GCE image ID")
     return SnapshotConfig(
         image=str(image), gpu=raw.get("gpu"), zones=zones,
-        boot_disk_size_gb=boot_disk_size_gb,
         resolution=_parse_resolution(raw.get("resolution"), image),
-        image_revision=image_revision,
     )
 
 
@@ -401,14 +413,38 @@ def generate_vm_name(
     return name[:63]
 
 
-async def _run_gcloud(*args: str, project: str) -> tuple[int, str, str]:
+async def _run_gcloud(*args: str, project: str, timeout: float | None = 1800.0) -> tuple[int, str, str]:
     cmd = ["gcloud", *args, f"--project={project}"]
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout_b, stderr_b = await proc.communicate()
+    if timeout is not None:
+        comm_task = asyncio.create_task(proc.communicate())
+        done, pending = await asyncio.wait([comm_task], timeout=timeout)
+        if not done:
+            logger.error("gcloud command timed out after %ss: %s", timeout, " ".join(cmd))
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                if proc.stdout and getattr(proc.stdout, "_transport", None):
+                    proc.stdout._transport.close()
+                if proc.stderr and getattr(proc.stderr, "_transport", None):
+                    proc.stderr._transport.close()
+            except Exception:
+                pass
+            comm_task.cancel()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5.0)
+            except Exception:
+                pass
+            return -1, "", f"gcloud command timed out after {timeout}s: {' '.join(cmd)}"
+        stdout_b, stderr_b = comm_task.result()
+    else:
+        stdout_b, stderr_b = await proc.communicate()
     return (
         proc.returncode or 0,
         stdout_b.decode(errors="replace"),
@@ -446,11 +482,10 @@ def _build_create_args(
     label_str: str,
     project: str,
     boot_disk_type: str,
-    boot_disk_size_gb: int | None,
 ) -> list[str]:
     """``gcloud compute instances create`` argv.
 
-    Boot disk size defaults to the image's baked size unless overridden.
+    Boot disk size is NOT passed — we use the GCE image's baked size.
     """
     args = [
         "compute",
@@ -460,7 +495,7 @@ def _build_create_args(
         f"--zone={zone}",
         f"--machine-type={machine_type}",
         f"--image={image}",
-        f"--image-project={project}",
+        f"--image-project={os.environ.get('ALE_IMAGE_PROJECT', 'lc5ecafd9243a819a-tp') if image not in ('ale-ubuntu22', 'ale-win10', 'ale-kasm', 'ale-ubuntu22-docker', 'ale-win-server') else project}",
         f"--boot-disk-type={boot_disk_type}",
         f"--network={network}",
         f"--subnet={subnet}",
@@ -468,8 +503,6 @@ def _build_create_args(
         f"--labels={label_str}",
         "--format=json",
     ]
-    if boot_disk_size_gb is not None:
-        args.append(f"--boot-disk-size={boot_disk_size_gb}GB")
     if gpu and not _is_accelerator_machine_type(machine_type):
         args.append(f"--accelerator=type={gpu},count=1")
     # onHostMaintenance: some families (c4) REQUIRE TERMINATE and reject MIGRATE;
@@ -493,7 +526,6 @@ async def _try_create_in_zone(
     zone: str,
     label_str: str,
     project: str,
-    boot_disk_size_gb: int | None,
 ) -> tuple[bool, str, str, str]:
     args = _build_create_args(
         name=name,
@@ -507,7 +539,6 @@ async def _try_create_in_zone(
         label_str=label_str,
         project=project,
         boot_disk_type=_boot_disk_type(machine_type),
-        boot_disk_size_gb=boot_disk_size_gb,
     )
     last_stderr = ""
     for attempt in range(1, _GCP_MAX_RETRIES_TRANSIENT + 1):
@@ -542,7 +573,7 @@ async def _try_create_in_zone(
                 )
                 await _delete_vm(name, zone, project)
             if attempt < _GCP_MAX_RETRIES_TRANSIENT:
-                delay = _GCP_TRANSIENT_BASE_DELAY * (2 ** (attempt - 1))
+                delay = min(300, _GCP_TRANSIENT_BASE_DELAY * (2 ** (attempt - 1)))
                 logger.warning(
                     "VM create transient error (attempt %d/%d): %s — retrying in %ds",
                     attempt,
@@ -559,10 +590,9 @@ async def _try_create_in_zone(
 
 def _extract_external_ip(inst: dict) -> str | None:
     for iface in inst.get("networkInterfaces", []):
-        for ac in iface.get("accessConfigs", []):
-            ip = ac.get("natIP")
-            if ip:
-                return ip
+        ip = iface.get("networkIP")
+        if ip:
+            return ip
     return None
 
 
@@ -577,6 +607,7 @@ async def _poll_for_ip(name: str, zone: str, project: str, timeout: float = 120)
             f"--zone={zone}",
             "--format=json",
             project=project,
+            timeout=30.0,
         )
         if rc == 0:
             try:
@@ -588,39 +619,6 @@ async def _poll_for_ip(name: str, zone: str, project: str, timeout: float = 120)
                 pass
         await asyncio.sleep(5)
     raise RuntimeError(f"Timed out waiting for external IP on {name}")
-
-
-async def _get_image_provenance(
-    inst: dict[str, Any], snapshot: SnapshotConfig, *, zone: str, project: str,
-) -> dict[str, Any]:
-    boot_disk = next((disk for disk in inst.get("disks", []) if disk.get("boot")), None)
-    if not boot_disk or not boot_disk.get("source"):
-        raise RuntimeError("GCloud image provenance requires an acquired boot disk")
-    disk_name = boot_disk["source"].rsplit("/", 1)[-1]
-    rc, stdout, stderr = await _run_gcloud(
-        "compute", "disks", "describe", disk_name,
-        f"--zone={zone}", "--format=json(sourceImage,sourceImageId)", project=project,
-    )
-    if rc != 0:
-        raise RuntimeError(f"Failed to inspect GCloud boot disk {disk_name}: {stderr}")
-    try:
-        disk_metadata = json.loads(stdout)
-        image_revision = str(disk_metadata["sourceImageId"])
-    except (ValueError, KeyError, TypeError) as exc:
-        raise RuntimeError(f"GCloud boot disk {disk_name} has no sourceImageId") from exc
-    if not re.fullmatch(r"[1-9][0-9]*", image_revision):
-        raise RuntimeError(f"GCloud boot disk {disk_name} has invalid sourceImageId {image_revision!r}")
-    if snapshot.image_revision is not None and snapshot.image_revision != image_revision:
-        raise RuntimeError(
-            f"GCloud image_revision mismatch: expected {snapshot.image_revision}, "
-            f"acquired {image_revision}"
-        )
-    return {
-        "provider": "gcloud",
-        "image": snapshot.image,
-        "image_revision": image_revision,
-        "source_image": disk_metadata.get("sourceImage"),
-    }
 
 
 def _probe_cua(cua_url: str, payload: dict) -> tuple[bool, str]:
@@ -787,7 +785,11 @@ def _init_computer_skip_wait(session: Any) -> None:
         noVNC_port=session._vnc_port,
     )
 
-    interface = InterfaceFactory.create_interface_for_os(
+    interface = InterfaceFactory.createInterface_for_os(
+        os=session._os_type,
+        ip_address=session._api_host,
+        api_port=session._api_port,
+    ) if hasattr(InterfaceFactory, "createInterface_for_os") else InterfaceFactory.create_interface_for_os(
         os=session._os_type,
         ip_address=session._api_host,
         api_port=session._api_port,
@@ -833,7 +835,9 @@ class GcloudProvider(Provider):
             )
 
         is_gpu = snap.gpu is not None
-        zones = snap.zones
+        # Shuffle zones within their geographic tier to balance load across zones
+        # while keeping regional preference (US -> EU -> Asia).
+        zones = _shuffle_zones_by_region(snap.zones)
 
         # Machine fallback: task-card override (or default) → N2 (CPU only).
         base_machine = spec.machine_type or (
@@ -877,7 +881,6 @@ class GcloudProvider(Provider):
                     zone=zone,
                     label_str=label_str,
                     project=self._cfg.project,
-                    boot_disk_size_gb=snap.boot_disk_size_gb,
                 )
                 if ok:
                     stdout = out
@@ -885,33 +888,7 @@ class GcloudProvider(Provider):
                     break
                 last_stderr = stderr
                 if not _is_zone_capacity_error(stderr):
-                    regional_missing = re.search(
-                        rf"machine type with name ['\"]?{re.escape(machine)}['\"]? "
-                        rf"does not exist in zone ['\"]?{re.escape(zone)}(?:['\".]|$)",
-                        stderr, re.IGNORECASE,
-                    ) or re.search(
-                        rf"/zones/{re.escape(zone)}/machineTypes/{re.escape(machine)}['\"] "
-                        r"was not found", stderr, re.IGNORECASE,
-                    )
-                    if not regional_missing:
-                        raise RuntimeError(f"gcloud instances create failed: {stderr}")
-                    listed_rc, listed_out, listed_err = await _run_gcloud(
-                        "compute", "machine-types", "list", f"--filter=name={machine}",
-                        "--limit=1", "--format=json", project=self._cfg.project,
-                    )
-                    if listed_rc:
-                        raise RuntimeError(
-                            f"gcloud machine-type availability check failed: {listed_err}"
-                        )
-                    try:
-                        available = json.loads(listed_out)
-                    except ValueError as exc:
-                        raise RuntimeError("gcloud machine-type availability returned invalid JSON") from exc
-                    if not isinstance(available, list) or not any(
-                        isinstance(item, dict) and item.get("name") == machine
-                        for item in available
-                    ):
-                        raise RuntimeError(f"gcloud instances create failed: {stderr}")
+                    raise RuntimeError(f"gcloud instances create failed: {stderr}")
             if stdout:
                 break
         else:
@@ -932,9 +909,6 @@ class GcloudProvider(Provider):
                     f"Failed to parse gcloud output: {e}\nstdout: {stdout[:500]}"
                 ) from e
 
-            image_provenance = await _get_image_provenance(
-                inst, snap, zone=used_zone, project=self._cfg.project,
-            )
             external_ip = _extract_external_ip(inst)
             if not external_ip:
                 external_ip = await _poll_for_ip(
@@ -957,9 +931,6 @@ class GcloudProvider(Provider):
             ready = await wait_cua_ready(cua_url, snap.os)
             if not ready:
                 raise RuntimeError(f"CUA server at {cua_url} did not become ready")
-
-            if image.os == "linux" and snap.boot_disk_size_gb is not None:
-                await self._expand_linux_root_disk(cua_url)
 
             # Force the Windows display resolution if the snapshot configures one
             # (Linux X picks its own size, so we never touch it). No silent
@@ -993,7 +964,6 @@ class GcloudProvider(Provider):
                     "machine_type": used_machine,
                     "external_ip": external_ip,
                     "image": image.name,
-                    "image_provenance": image_provenance,
                     "snapshot": spec.snapshot,
                     "gcs_key_path": gcs_key_path,
                     "gcs_user_project": gcs_user_project,
@@ -1010,53 +980,6 @@ class GcloudProvider(Provider):
             except Exception as de:  # noqa: BLE001
                 logger.error("acquire: could not delete leaked VM %s: %s", name, de)
             raise
-
-    @staticmethod
-    async def _expand_linux_root_disk(cua_url: str) -> None:
-        """Grow the Linux root partition and filesystem to the boot disk size."""
-        from cua_bench.computers.remote import RemoteDesktopSession
-
-        session = RemoteDesktopSession(api_url=cua_url, os_type="linux")
-        _init_computer_skip_wait(session)
-        script = r"""
-set -eu
-root="$(findmnt -n -o SOURCE /)"
-parent="$(lsblk -no PKNAME "$root")"
-partition="$(lsblk -no PARTN "$root")"
-test -n "$parent"
-test -n "$partition"
-sudo growpart "/dev/$parent" "$partition" || true
-fstype="$(findmnt -n -o FSTYPE /)"
-case "$fstype" in
-  ext2|ext3|ext4) sudo resize2fs "$root" ;;
-  xfs) sudo xfs_growfs / ;;
-  *) echo "unsupported root filesystem: $fstype" >&2; exit 1 ;;
-esac
-partition_bytes="$(lsblk -bno SIZE "$root")"
-filesystem_bytes="$(df -B1 --output=size / | tail -1 | tr -d ' ')"
-test "$filesystem_bytes" -ge "$((partition_bytes * 95 / 100))"
-df -h /
-"""
-        result = await session.run_command(
-            f"bash -lc {shlex.quote(script)}",
-            check=False,
-        )
-        return_code = (
-            result.get("return_code")
-            if isinstance(result, dict)
-            else None
-        )
-        if return_code != 0:
-            stderr = result.get("stderr", "") if isinstance(result, dict) else ""
-            stdout = result.get("stdout", "") if isinstance(result, dict) else ""
-            raise RuntimeError(
-                "gcloud: failed to expand Linux root disk: "
-                f"{stderr or stdout or result}"
-            )
-        logger.info(
-            "gcloud: expanded Linux root disk: %s",
-            str(result.get("stdout", "")).strip(),
-        )
 
     @staticmethod
     async def _set_windows_resolution(

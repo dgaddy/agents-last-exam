@@ -87,6 +87,10 @@ _DONE_LINE_RE = re.compile(
 
 
 def has_done_signal(output: List[Dict[str, Any]]) -> bool:
+    has_tools = any(item.get("type") in ("function_call", "computer_call") for item in output)
+    if has_tools:
+        return False
+
     """Return True if the assistant output contains the DONE completion signal.
 
     Single source of truth for OpenClaw's task-completion detection. Used by

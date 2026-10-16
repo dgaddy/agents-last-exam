@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json as _json
+import os
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from .model_config import ResolvedModel, resolve_model
+from .model_config import ResolvedModel, call_with_retry_budget, resolve_model
 
 
 @dataclass(frozen=True)
@@ -25,19 +26,12 @@ async def call_helper_model(
     temperature: float,
     timeout: int | None = None,
     thinking_params: dict[str, Any] | None = None,
-    api_key: str | None = None,
-    api_base: str | None = None,
 ) -> HelperCallResult:
     """Call a helper model using the resolved transport defaults for the purpose."""
     import litellm
 
     resolved = resolve_model(model)
     transport = resolved.helper_transport_defaults.for_purpose(purpose)
-    connection_kwargs: dict[str, Any] = {}
-    if api_key is not None:
-        connection_kwargs["api_key"] = api_key
-    if api_base is not None:
-        connection_kwargs["api_base"] = api_base
 
     if transport == "responses":
         kwargs: dict[str, Any] = {
@@ -46,13 +40,15 @@ async def call_helper_model(
             "max_tokens": max_tokens,
             "temperature": temperature,
             **(thinking_params or {}),
-            **connection_kwargs,
         }
         if timeout is not None:
             kwargs["timeout"] = timeout
         if tools:
             kwargs["tools"] = [_to_responses_function_tool(tool) for tool in tools]
-        response = await litellm.aresponses(**kwargs)
+        response = await call_with_retry_budget(
+            lambda: litellm.aresponses(**kwargs),
+            label=f"helper:{purpose}({resolved.model})",
+        )
         payload = response.model_dump()
         return HelperCallResult(
             text=_extract_responses_text(payload.get("output", [])),
@@ -65,13 +61,15 @@ async def call_helper_model(
         "max_tokens": max_tokens,
         "temperature": temperature,
         **(thinking_params or {}),
-        **connection_kwargs,
     }
     if timeout is not None:
         kwargs["timeout"] = timeout
     if tools:
         kwargs["tools"] = tools
-    response = await litellm.acompletion(**kwargs)
+    response = await call_with_retry_budget(
+        lambda: litellm.acompletion(**kwargs),
+        label=f"helper:{purpose}({resolved.model})",
+    )
     choice = response.choices[0]
     return HelperCallResult(
         text=(choice.message.content or "").strip(),

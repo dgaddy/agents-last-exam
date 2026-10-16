@@ -34,7 +34,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from ..model.model_config import ResolvedModel, resolve_model
+from ..model.model_config import ResolvedModel, call_with_retry_budget, resolve_model
 from agent.tools.base import BaseTool
 
 from ..context.context import (
@@ -359,7 +359,10 @@ class GeneralSubagentSession:
         }
         if self._tool_schemas:
             kwargs["tools"] = self._tool_schemas
-        return await litellm_mod.acompletion(**kwargs)
+        return await call_with_retry_budget(
+            lambda: litellm_mod.acompletion(**kwargs),
+            label=f"subagent({resolved.model})",
+        )
 
     # ------------------------------------------------------------------
     # Tool execution + transcript helpers

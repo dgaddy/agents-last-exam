@@ -263,7 +263,15 @@ async def run_one_unit(
             # ============================================================
             writer.emit_event("provision_started")
             env = ALEEnv(provider=provider, spec=env_spec)
-            await env.reset_async()
+            try:
+                await asyncio.wait_for(
+                    env.reset_async(),
+                    timeout=max(18000.0, float(timeout_s)),
+                )
+            except (asyncio.TimeoutError, TimeoutError) as exc:
+                raise TimeoutError(
+                    f"VM provisioning timed out after {max(18000.0, float(timeout_s))}s"
+                ) from exc
             environment_metadata = dict(env.sandbox.metadata.get("image_provenance") or {})
             environment_metadata["snapshot"] = env_spec.snapshot
             writer.emit_event(
@@ -461,51 +469,55 @@ async def run_one_unit(
             #     Pull reference data from GCS to the env if the task needs
             #     it for scoring. Backends explicitly report missing
             #     reference data; real staging errors abort evaluation.
-            env.set_phase("stage_reference")
-            await stage_reference(
-                env=env, provider=provider, artifacts=artifacts, task_meta=task_meta,
-                run_id=writer.run_id, task_id=unit.task_path, writer=writer,
-            )
-
-            # 3c. RUNNING_EVAL. Raw eval output is funnelled into
-            #     eval_result.json + run.json + trajectory.json — there is
-            #     no debug/ folder in the new spec, so simprun's
-            #     `debug/eval/result.json` raw dump has no destination here.
-            env.set_phase("evaluation")
-            eval_start = time.monotonic()
-            # End of the execution window (everything up to, but excluding, eval).
-            exec_ended = eval_start
+            writer.start_verifier_logging()
             try:
-                eval_out = await asyncio.wait_for(
-                    task_driver.evaluate(), timeout=_EVAL_TIMEOUT_S,
+                env.set_phase("stage_reference")
+                await stage_reference(
+                    env=env, provider=provider, artifacts=artifacts, task_meta=task_meta,
+                    run_id=writer.run_id, task_id=unit.task_path, writer=writer,
                 )
-                eval_duration_s = round(time.monotonic() - eval_start, 4)
-                if eval_out is None or eval_out.get("error"):
-                    eval_status = "failed"
-                    eval_error = (
-                        {"type": "Exception", "message": str(eval_out.get("error")),
-                         "traceback": str(eval_out.get("error"))}
-                        if eval_out
-                        else None
+
+                # 3c. RUNNING_EVAL. Raw eval output is funnelled into
+                #     eval_result.json + run.json + trajectory.json — there is
+                #     no debug/ folder in the new spec, so simprun's
+                #     `debug/eval/result.json` raw dump has no destination here.
+                env.set_phase("evaluation")
+                eval_start = time.monotonic()
+                # End of the execution window (everything up to, but excluding, eval).
+                exec_ended = eval_start
+                try:
+                    eval_out = await asyncio.wait_for(
+                        task_driver.evaluate(), timeout=_EVAL_TIMEOUT_S,
                     )
-                else:
-                    eval_status = "success"
-                    score = _extract_score(eval_out)
-            except asyncio.TimeoutError:
-                eval_duration_s = round(time.monotonic() - eval_start, 4)
-                # Eval ran out of wall-clock — treat as a timeout (not a failure)
-                # so the unit status is "timeout" and resume skips it.
-                eval_status = "timeout"
-                eval_error = {
-                    "type": "TimeoutError",
-                    "message": f"evaluate() exceeded {_EVAL_TIMEOUT_S}s wall-clock",
-                }
-                logger.error("evaluate timed out after %ds for %s", _EVAL_TIMEOUT_S, unit.slug)
-            except Exception as e:
-                eval_duration_s = round(time.monotonic() - eval_start, 4)
-                eval_status = "failed"
-                eval_error = err_dict(e)
-                logger.exception("evaluate raised for %s", unit.slug)
+                    eval_duration_s = round(time.monotonic() - eval_start, 4)
+                    if eval_out is None or eval_out.get("error"):
+                        eval_status = "failed"
+                        eval_error = (
+                            {"type": "Exception", "message": str(eval_out.get("error")),
+                             "traceback": str(eval_out.get("error"))}
+                            if eval_out
+                            else None
+                        )
+                    else:
+                        eval_status = "success"
+                        score = _extract_score(eval_out)
+                except asyncio.TimeoutError:
+                    eval_duration_s = round(time.monotonic() - eval_start, 4)
+                    # Eval ran out of wall-clock — treat as a timeout (not a failure)
+                    # so the unit status is "timeout" and resume skips it.
+                    eval_status = "timeout"
+                    eval_error = {
+                        "type": "TimeoutError",
+                        "message": f"evaluate() exceeded {_EVAL_TIMEOUT_S}s wall-clock",
+                    }
+                    logger.error("evaluate timed out after %ds for %s", _EVAL_TIMEOUT_S, unit.slug)
+                except Exception as e:
+                    eval_duration_s = round(time.monotonic() - eval_start, 4)
+                    eval_status = "failed"
+                    eval_error = err_dict(e)
+                    logger.exception("evaluate raised for %s", unit.slug)
+            finally:
+                writer.stop_verifier_logging()
 
             # ============================================================
             # Trajectory finalize via deployer.parse_artifacts (LOG_SPEC §5)

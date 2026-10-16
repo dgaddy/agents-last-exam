@@ -333,7 +333,7 @@ class AleClawDeployer(BaseAgentDeployer):
         agent = OpenClawComputerAgent(
             model=cfg.model,
             tools=tools,
-            only_n_most_recent_images=3,
+            only_n_most_recent_images=int(os.environ["ALE_ONLY_N_MOST_RECENT_IMAGES"]) if os.environ.get("ALE_ONLY_N_MOST_RECENT_IMAGES") else None,
             trajectory_dir=trajectory_dir,
             instructions=instructions,
             use_prompt_caching=True,

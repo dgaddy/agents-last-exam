@@ -7,6 +7,8 @@ LOG_SPEC.md is the source of truth; this class is its only writer. Layout:
         run.json           schema_version=2, written once at finalize
         trajectory.json    ATIF-v1.0 from Trajectory.model_dump_json(indent=2)
         eval_result.json   {eval_status, score, eval_duration_s, error}
+        eval.log           mirrors Python root logger output for this run
+        verifier.log       Python logger output while the verifier is running
         origin_log/<agent_name>/    deployer work_dir pulled from VM
         output/                     agent output, when output_path="local"
 
@@ -113,6 +115,16 @@ class RunWriter:
         # Line-buffered append; fsync after each write for SIGTERM safety.
         self._events_fh = self._events_path.open("a", buffering=1, encoding="utf-8")
 
+        # Capture Python root logger output for this run into eval.log.
+        self._log_handler = logging.FileHandler(
+            self._run_dir / "eval.log", encoding="utf-8",
+        )
+        self._log_handler.setFormatter(
+            logging.Formatter("%(asctime)s  %(levelname)-7s  %(name)s  %(message)s")
+        )
+        logging.getLogger().addHandler(self._log_handler)
+        self._verifier_log_handler = None
+
     # ------------------------------------------------------------------ props
 
     @property
@@ -192,7 +204,34 @@ class RunWriter:
         except OSError as e:
             logger.warning("write_eval_result failed: %s", e)
 
+    def start_verifier_logging(self) -> None:
+        if self._verifier_log_handler is not None:
+            return
+        self._verifier_log_handler = logging.FileHandler(
+            self._run_dir / "verifier.log", encoding="utf-8",
+        )
+        self._verifier_log_handler.setFormatter(
+            logging.Formatter("%(asctime)s  %(levelname)-7s  %(name)s  %(message)s")
+        )
+        logging.getLogger().addHandler(self._verifier_log_handler)
+
+    def stop_verifier_logging(self) -> None:
+        if self._verifier_log_handler is None:
+            return
+        try:
+            logging.getLogger().removeHandler(self._verifier_log_handler)
+            self._verifier_log_handler.close()
+        except Exception:
+            pass
+        self._verifier_log_handler = None
+
     def close(self) -> None:
+        self.stop_verifier_logging()
+        try:
+            logging.getLogger().removeHandler(self._log_handler)
+            self._log_handler.close()
+        except Exception:
+            pass
         try:
             self._events_fh.close()
         except OSError:

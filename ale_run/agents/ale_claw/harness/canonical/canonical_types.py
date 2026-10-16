@@ -37,6 +37,8 @@ class FunctionCallBlock(TypedDict):
     id: str
     name: str
     arguments: str  # JSON string
+    provider_specific_fields: NotRequired[dict[str, Any]]
+    extra_content: NotRequired[dict[str, Any]]
 
 
 class ComputerCallBlock(TypedDict):
@@ -49,6 +51,8 @@ class ComputerCallBlock(TypedDict):
     type: Literal["computer_call"]
     id: str
     actions: list[dict[str, Any]]
+    provider_specific_fields: NotRequired[dict[str, Any]]
+    extra_content: NotRequired[dict[str, Any]]
 
 
 class ToolResultBlock(TypedDict):
