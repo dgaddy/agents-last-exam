@@ -373,14 +373,15 @@ def test_custom_download_requires_checksum(tmp_path: Path) -> None:
         _install_release(config, str(tmp_path), is_windows=False)
 
 
-def test_pinned_release_does_not_depend_on_latest_manifest() -> None:
-    linux_url, linux_checksum = _official_release("1.1.25", is_windows=False)
-    windows_url, windows_checksum = _official_release("1.1.25", is_windows=True)
+@pytest.mark.parametrize("version", ["1.1.25", "1.4.7"])
+def test_pinned_release_does_not_depend_on_latest_manifest(version: str) -> None:
+    linux_url, linux_checksum = _official_release(version, is_windows=False)
+    windows_url, windows_checksum = _official_release(version, is_windows=True)
 
-    assert "/1.1.25-" in linux_url
+    assert f"/{version}-" in linux_url
     assert linux_url.endswith("/cli_linux_x64.tar.gz")
     assert len(linux_checksum) == 128
-    assert "/1.1.25-" in windows_url
+    assert f"/{version}-" in windows_url
     assert windows_url.endswith("/cli_windows_x64.exe")
     assert len(windows_checksum) == 128
 
@@ -393,7 +394,7 @@ def test_pinned_release_does_not_depend_on_latest_manifest() -> None:
         ("failed", "success", "failed"),
         ("completed", "timeout", "timeout"),
         ("timeout", "success", "timeout"),
-        ("timeout", "failed", "timeout"),
+        ("timeout", "failed", "failed"),
         ("failed", "timeout", "failed"),
     ],
 )
@@ -409,7 +410,7 @@ def test_run_metadata_records_cli_version() -> None:
     agent = AgentSpec(
         id="antigravity-cli",
         class_="antigravity_cli",
-        config={"model": "Gemini 3.7 Flash (High)", "cli_version": "1.1.25"},
+        config={"model": "Gemini 3.7 Flash (High)", "cli_version": "1.4.7"},
     )
     unit = RunUnit(
         agent_id=agent.id,
@@ -433,7 +434,7 @@ def test_run_metadata_records_cli_version() -> None:
         category=None,
     )
 
-    assert metadata["agent"]["version"] == "1.1.25"
+    assert metadata["agent"]["version"] == "1.4.7"
 
 
 @pytest.mark.asyncio
@@ -471,7 +472,7 @@ async def test_windows_prewarm_places_global_flag_before_subcommand(
 
 
 @pytest.mark.asyncio
-async def test_launch_passes_prompt_as_print_value(
+async def test_launch_passes_prompt_via_stdin_without_print_argv(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -502,6 +503,9 @@ async def test_launch_passes_prompt_as_print_value(
     def fake_spawn(argv: list[str], **kwargs: object) -> FakeProcess:
         captured["argv"] = argv
         captured.update(kwargs)
+        prompt_path = kwargs["prompt_file"]
+        assert isinstance(prompt_path, Path)
+        captured["prompt_text"] = prompt_path.read_text(encoding="utf-8")
         transcript = kwargs["transcript_file"]
         assert isinstance(transcript, Path)
         transcript.write_text(
@@ -511,12 +515,17 @@ async def test_launch_passes_prompt_as_print_value(
         return FakeProcess()
 
     monkeypatch.setattr("ale_run.agents.antigravity_cli.deployer._spawn_agy", fake_spawn)
-    result = await deployer.launch("full task instruction")
+    result = await deployer.launch("full task instruction with pw.x")
 
     argv = captured["argv"]
     assert isinstance(argv, list)
-    assert argv[1] == "--print=full task instruction"
+    assert all(
+        "pw.x" not in arg and arg != "--print" and not arg.startswith("--print=")
+        for arg in argv
+    )
     assert "-p" not in argv
+    assert captured["prompt_text"] == "full task instruction with pw.x"
+    assert captured["append"] is False
     assert f"--log-file={tmp_path / 'agy_cli.log'}" in argv
     assert argv[argv.index("--output-format") + 1] == "stream-json"
     child_env = captured["env"]
@@ -525,6 +534,305 @@ async def test_launch_passes_prompt_as_print_value(
     assert "ANTIGRAVITY_OAUTH_TOKEN_PATH" not in child_env
     assert "ANTIGRAVITY_GOOGLE_ACCOUNTS" not in child_env
     assert result.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_install_and_launch_gemini_provider_routes_through_proxy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home_dir = tmp_path / "home"
+    work_dir = tmp_path / "work"
+    data_dir = tmp_path / "task_data"
+    managed_agy = home_dir / ".local" / "bin" / "agy"
+    managed_agy.parent.mkdir(parents=True)
+    managed_agy.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    config = AntigravityCliConfig(
+        model="gemini-v5-555b-byom-safety",
+        provider="gemini",
+        base_url="http://10.128.0.42:8080",
+        api_key="proxy-token",
+        effort="high",
+    )
+    sandbox = SimpleNamespace(
+        is_linux=True,
+        node="/usr/bin/node",
+        mcp_server_dir="/opt/cua_mcp",
+        task_data_root=str(data_dir),
+    )
+    executor = SimpleNamespace(
+        work_dir=str(work_dir),
+        env={},
+        sandbox=sandbox,
+        config=config,
+    )
+    deployer = AntigravityCliDeployer(executor)
+
+    monkeypatch.setenv("HOME", str(home_dir))
+    monkeypatch.delenv("ANTIGRAVITY_OAUTH_TOKEN", raising=False)
+    monkeypatch.delenv("ANTIGRAVITY_OAUTH_TOKEN_PATH", raising=False)
+    monkeypatch.setattr(
+        "ale_run.agents.antigravity_cli.deployer._installed_version",
+        lambda _: "1.4.7",
+    )
+
+    async def fake_ensure_cua(_sandbox: object) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "ale_run.agents._bootstrap.ensure_cua_mcp_server",
+        fake_ensure_cua,
+    )
+    monkeypatch.setattr(
+        "ale_run.agents._bootstrap.cua_bridge_env",
+        lambda _exec: {"DISPLAY": ":0"},
+    )
+
+    await deployer.install()
+
+    settings = json.loads(
+        (home_dir / ".gemini" / "antigravity-cli" / "settings.json").read_text(encoding="utf-8")
+    )
+    assert settings["modelProvider"] == "gemini"
+    assert settings["allowNonWorkspaceAccess"] is True
+    assert settings["disableSlashCommands"] is True
+    assert settings["customModelsConfig"] == {
+        "customModels": {
+            "gemini-v5-555b-byom-safety": {
+                "modelName": "gemini-v5-555b-byom-safety",
+                "apiProvider": "API_PROVIDER_GOOGLE_GEMINI",
+                "toolFormatterType": "TOOL_FORMATTER_TYPE_NONE",
+            }
+        }
+    }
+    assert json.loads(
+        (home_dir / ".gemini" / "antigravity-cli" / "onboarding.json").read_text(encoding="utf-8")
+    ) == {"completed": True}
+    assert json.loads(
+        (home_dir / ".gemini" / "antigravity-cli" / "cache" / "onboarding.json").read_text(
+            encoding="utf-8"
+        )
+    ) == {"completed": True}
+    assert (home_dir / ".gemini" / "config" / "mcp_config.json").is_file()
+
+    captured: dict[str, object] = {}
+
+    class FakeProcess:
+        pid = 321
+        returncode = 0
+
+        def poll(self) -> int:
+            return 0
+
+    def fake_spawn(argv: list[str], **kwargs: object) -> FakeProcess:
+        captured["argv"] = argv
+        captured.update(kwargs)
+        transcript = kwargs["transcript_file"]
+        assert isinstance(transcript, Path)
+        transcript.write_text(
+            json.dumps({"event": "result", "result": {"status": "SUCCESS"}}) + "\n",
+            encoding="utf-8",
+        )
+        return FakeProcess()
+
+    monkeypatch.setattr("ale_run.agents.antigravity_cli.deployer._spawn_agy", fake_spawn)
+    result = await deployer.launch("solve task")
+    assert result.status == "completed"
+
+    argv = captured["argv"]
+    assert isinstance(argv, list)
+    assert argv[argv.index("--model") + 1] == "gemini-v5-555b-byom-safety"
+    assert argv[argv.index("--effort") + 1] == "high"
+    assert "--disable-slash-commands" in argv
+    add_dirs = [argv[i + 1] for i, flag in enumerate(argv) if flag == "--add-dir"]
+    assert add_dirs == [str(work_dir), str(data_dir)]
+
+    child_env = captured["env"]
+    assert isinstance(child_env, dict)
+    assert child_env["GEMINI_API_KEY"] == "proxy-token"
+    assert child_env["GOOGLE_GEMINI_BASE_URL"] == "http://10.128.0.42:8080"
+    assert child_env["AGY_CLI_DISABLE_AUTO_UPDATE"] == "1"
+    assert child_env["GEMINI_CLI_TRUST_WORKSPACE"] == "true"
+    assert "10.128.0.42" in child_env["NO_PROXY"].split(",")
+    assert "10.128.0.42" in child_env["no_proxy"].split(",")
+
+
+@pytest.mark.asyncio
+async def test_launch_resumes_conversation_on_transient_502_and_reconciles_metrics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = AntigravityCliConfig(
+        model="gemini-v5-555b-byom-safety",
+        provider="gemini",
+        base_url="http://10.128.0.42:8080",
+        max_api_retries=2,
+    )
+    sandbox = SimpleNamespace(task_data_root="", is_linux=True)
+    executor = SimpleNamespace(work_dir=str(tmp_path), env={}, sandbox=sandbox, config=config)
+    deployer = AntigravityCliDeployer(executor)
+    deployer._agy_path = "/fake/agy"
+    deployer._gemini_dir = "/fake/.gemini"
+
+    calls: list[dict[str, object]] = []
+
+    class FakeProcess:
+        def __init__(self, pid: int, rc: int) -> None:
+            self.pid = pid
+            self.returncode = rc
+
+        def poll(self) -> int:
+            return self.returncode
+
+    async def fast_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr("asyncio.sleep", fast_sleep)
+
+    def fake_spawn(argv: list[str], **kwargs: object) -> FakeProcess:
+        prompt_path = kwargs["prompt_file"]
+        transcript = kwargs["transcript_file"]
+        append = kwargs["append"]
+        assert isinstance(prompt_path, Path)
+        assert isinstance(transcript, Path)
+        calls.append(
+            {
+                "argv": list(argv),
+                "append": append,
+                "prompt": prompt_path.read_text(encoding="utf-8"),
+            }
+        )
+        log_arg = next(a for a in argv if a.startswith("--log-file="))
+        log_path = Path(log_arg.split("=", 1)[1])
+
+        if len(calls) == 1:
+            log_path.write_text(
+                "I1027 01:00:00.000000 1 http.go:1] "
+                "URL: http://10.128.0.42:8080/v1beta:streamGenerateContent "
+                "Trace: 0x1 ResponseID: resp-1\n",
+                encoding="utf-8",
+            )
+            events = [
+                {"event": "init", "init": {"model": "gemini-v5-555b-byom-safety"}},
+                {
+                    "event": "step_update",
+                    "step_update": {
+                        "conversation_id": "conv-resume-1",
+                        "step_index": 1,
+                        "state": "DONE",
+                        "step_type": "agent_response",
+                        "text_delta": "step one",
+                        "duration_seconds": 1.0,
+                        "usage": {
+                            "input_tokens": 50,
+                            "output_tokens": 10,
+                            "thinking_tokens": 5,
+                            "cache_read_tokens": 0,
+                            "total_tokens": 65,
+                        },
+                    },
+                },
+                {
+                    "event": "result",
+                    "result": {
+                        "conversation_id": "conv-resume-1",
+                        "status": "ERROR",
+                        "error": "AgentError: model api cannot be reached: status code 502",
+                        "usage": {
+                            "input_tokens": 50,
+                            "output_tokens": 10,
+                            "thinking_tokens": 5,
+                            "cache_read_tokens": 0,
+                            "total_tokens": 65,
+                        },
+                    },
+                },
+            ]
+            transcript.write_text(
+                "".join(json.dumps(e) + "\n" for e in events),
+                encoding="utf-8",
+            )
+            return FakeProcess(pid=101, rc=1)
+
+        log_path.write_text(
+            "I1027 01:00:05.000000 2 http.go:1] "
+            "URL: http://10.128.0.42:8080/v1beta:streamGenerateContent "
+            "Trace: 0x2 ResponseID: resp-2\n",
+            encoding="utf-8",
+        )
+        resumed_events = [
+            {"event": "init", "init": {"model": "gemini-v5-555b-byom-safety"}},
+            {
+                "event": "step_update",
+                "step_update": {
+                    "conversation_id": "conv-resume-1",
+                    "step_index": 3,
+                    "state": "DONE",
+                    "step_type": "agent_response",
+                    "text_delta": "completed task",
+                    "duration_seconds": 1.5,
+                    "usage": {
+                        "input_tokens": 80,
+                        "output_tokens": 15,
+                        "thinking_tokens": 6,
+                        "cache_read_tokens": 40,
+                        "total_tokens": 141,
+                    },
+                },
+            },
+            {
+                "event": "result",
+                "result": {
+                    "conversation_id": "conv-resume-1",
+                    "status": "SUCCESS",
+                    "response": "completed task",
+                    "duration_seconds": 2.5,
+                    "num_turns": 2,
+                    "usage": {
+                        "input_tokens": 130,
+                        "output_tokens": 25,
+                        "thinking_tokens": 11,
+                        "cache_read_tokens": 40,
+                        "total_tokens": 206,
+                    },
+                },
+            },
+        ]
+        with transcript.open("a", encoding="utf-8") as handle:
+            for event in resumed_events:
+                handle.write(json.dumps(event) + "\n")
+        return FakeProcess(pid=102, rc=0)
+
+    monkeypatch.setattr("ale_run.agents.antigravity_cli.deployer._spawn_agy", fake_spawn)
+    result = await deployer.launch("initial prompt")
+
+    assert result.status == "completed"
+    assert result.error is None
+    assert len(calls) == 2
+    assert calls[0]["append"] is False
+    assert "--conversation" not in calls[0]["argv"]  # type: ignore[operator]
+    assert calls[1]["append"] is True
+    argv_retry = calls[1]["argv"]
+    assert isinstance(argv_retry, list)
+    assert argv_retry[argv_retry.index("--conversation") + 1] == "conv-resume-1"
+
+    builder = TrajectoryBuilder(
+        agent_name="antigravity-cli", task_path="demo/resume", variant_index=0
+    )
+    AntigravityCliDeployer.parse_artifacts(
+        work_dir=tmp_path,
+        config=config,
+        run_result=result,
+        builder=builder,
+    )
+    summary = json.loads((tmp_path / "metrics_summary.json").read_text(encoding="utf-8"))
+    assert summary["physical_request_count"] == 2
+    assert summary["logical_model_generation_count"] == 2
+    assert summary["availability"]["generation_usage_reconciles_with_result"] is True
+    final_metrics = builder.finalize(reward=1.0, status="completed").final_metrics
+    assert final_metrics.total_input_tokens == 130
+    assert final_metrics.total_output_tokens == 25
 
 
 @pytest.mark.asyncio

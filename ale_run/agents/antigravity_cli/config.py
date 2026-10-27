@@ -32,7 +32,7 @@ class AntigravityCliConfig:
     dangerously_skip_permissions: bool = True
 
     # Pinned CLI version. The deployer enforces this exact version.
-    cli_version: str = "1.1.25"
+    cli_version: str = "1.4.7"
 
     # Override the install source. Empty => resolve the exact version from the
     # official updater manifest. A direct binary/tarball URL may be supplied for
@@ -47,4 +47,18 @@ class AntigravityCliConfig:
     # model, or a multi-step task) before it finishes — the run then has no
     # output. Set it well above any task's wall budget so the orchestration's
     # ``wall_time_s`` is the real cap, not agy's internal timer.
-    print_timeout: str = "120m"
+    print_timeout: str = "24h"
+
+    # Auth / endpoint provider: "oauth" (default ALE flow) or "gemini"
+    # (direct / proxy-routed Gemini API via GOOGLE_GEMINI_BASE_URL).
+    provider: str = "oauth"
+    base_url: str = ""
+    api_key: str | None = None
+
+    # Explicit reasoning effort passed via ``--effort`` when non-empty.
+    effort: str = ""
+
+    # Max in-place ``--conversation`` resume attempts when a turn aborts on a
+    # transient proxy/upstream error (502/503/504/429/connection reset) or
+    # single-turn output token limit.
+    max_api_retries: int = 5
