@@ -7,28 +7,33 @@
 - Install: official installer `https://antigravity.google/cli/install.sh` drops
   `~/.local/bin/agy`. Pinnable tarball via the updater manifest
   (`.../manifests/linux_amd64.json` → `storage.googleapis.com/antigravity-public/...`).
-  The current ALE pin is `1.1.25`; its official URL and checksum are retained in
-  the deployer so a newer latest-only manifest does not break reproducible installs.
-- Auth: this integration uses Google OAuth via the host-login → token-file →
-  in-sandbox-injection flow. `agy` also supports Gemini API keys; OpenRouter's
-  OpenAI-compatible endpoint is not wire-compatible with agy's native Gemini
-  requests without a translation proxy.
+  The current ALE pin is `1.4.7` (with `1.1.25` also retained); its official URL
+  and checksum are retained in the deployer so a newer latest-only manifest does
+  not break reproducible installs.
+- Auth: default `provider: oauth` uses Google OAuth via the host-login → token-file →
+  in-sandbox-injection flow. `provider: gemini` configures `modelProvider: "gemini"`,
+  `customModelsConfig`, `GEMINI_API_KEY`, and `GOOGLE_GEMINI_BASE_URL` for direct
+  or proxy-routed Gemini endpoints. OpenRouter's OpenAI-compatible endpoint is not
+  wire-compatible with agy's native Gemini requests without a translation proxy.
 
 ## Install
 
 `AntigravityCliDeployer.install()` probes `agy --version` and installs the exact
 configured release from Google's updater manifest when missing or mismatched.
-It verifies the manifest SHA-512, then writes the OAuth credential, CUA MCP
-config, and CLI policy settings. Linux targets `~/.local/bin/agy`; Windows
-targets `%LOCALAPPDATA%\agy\bin\agy.exe`.
+It verifies the manifest SHA-512, then writes the OAuth credential (when
+`provider != "gemini"`), CLI policy settings, and CUA MCP config. Linux targets
+`~/.local/bin/agy`; Windows targets `%LOCALAPPDATA%\agy\bin\agy.exe`.
 
 ## Runtime
 
-The deployer launches:
+The deployer writes the prompt to `prompt.txt` and pipes it via `stdin` (keeping
+prompt text out of `argv` / `/proc/<pid>/cmdline` so agent `pkill -f` commands
+never kill `agy` itself):
 
 ```bash
-agy --print="<prompt>" --model "<display name>" --output-format stream-json \
-  --dangerously-skip-permissions --add-dir <task_data_root>
+agy --model "<display name>" --output-format stream-json \
+  --dangerously-skip-permissions --add-dir <work_dir> --add-dir <task_data_root> \
+  < prompt.txt
 ```
 
 - `--model` takes the `agy models` display names verbatim (e.g.

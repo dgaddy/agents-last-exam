@@ -33,6 +33,7 @@ import subprocess
 import tarfile
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import ClassVar
@@ -55,9 +56,76 @@ logger = logging.getLogger(__name__)
 
 _POLL_INTERVAL_S = 2.0
 _TERM_GRACE_S = 2.0
+_RETRY_BACKOFF_BASE_S = 5.0
+_RETRYABLE_ERROR_SUBSTRINGS: tuple[str, ...] = (
+    "error 500",
+    "error 502",
+    "error 503",
+    "error 504",
+    "error 429",
+    "status code 500",
+    "status code 502",
+    "status code 503",
+    "status code 504",
+    "status code 429",
+    "http 500",
+    "http 502",
+    "http 503",
+    "http 504",
+    "http 429",
+    "502 bad gateway",
+    "503 service unavailable",
+    "504 gateway timeout",
+    "model api cannot be reached",
+    "remote end closed connection",
+    "connection reset",
+    "connection refused",
+    "broken pipe",
+    "unexpected eof",
+    ": eof",
+    "stream interrupted",
+    "unavailable",
+    "deadline_exceeded",
+    "resource_exhausted",
+    "exceeded the output token limit",
+    "max_tokens",
+)
+_NON_RETRYABLE_ERROR_SUBSTRINGS: tuple[str, ...] = (
+    "individual quota reached",
+    "authentication failed",
+    "permission_denied",
+    "permission denied",
+    "unauthenticated",
+    "invalid api key",
+)
+_RESUME_PROMPT = (
+    "Your previous response hit the single-turn output token limit or encountered "
+    "a transient transport error. Continue from where you left off using concise "
+    "steps and tool calls to complete the task."
+)
 _VERSION_RE = re.compile(r"(\d+\.\d+\.\d+)")
 _UPDATER_BASE_URL = "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app"
 _PINNED_RELEASES: dict[tuple[str, str], tuple[str, str]] = {
+    ("1.4.7", "linux_amd64"): (
+        (
+            "https://storage.googleapis.com/antigravity-public/antigravity-cli/"
+            "1.4.7-5900205422411776/linux-x64/cli_linux_x64.tar.gz"
+        ),
+        (
+            "beda760587589f5827b0b516c3ec2c5bd5cd2e91eb0e2533807ba1e990a27dcd"
+            "63aef0191e0b76fb60feab0d16eaa8210fb79842c34dd4809e257e1712edd152"
+        ),
+    ),
+    ("1.4.7", "windows_amd64"): (
+        (
+            "https://storage.googleapis.com/antigravity-public/antigravity-cli/"
+            "1.4.7-5900205422411776/windows-x64/cli_windows_x64.exe"
+        ),
+        (
+            "e9e69f036ef0a9c3329cd0608474711dfdbbf62df10a98e237c9fb528daf36be"
+            "21b4ee65b796b07e0f10ec266f008bb9e40a9c59ba32e4d13ca87bfeb36d3c2a"
+        ),
+    ),
     ("1.1.25", "linux_amd64"): (
         (
             "https://storage.googleapis.com/antigravity-public/antigravity-cli/"
@@ -223,16 +291,23 @@ def _install_release(cfg: AntigravityCliConfig, home: str, *, is_windows: bool) 
 def _spawn_agy(
     argv: list[str],
     *,
+    prompt_file: Path,
     transcript_file: Path,
     stderr_log: Path,
     env: dict[str, str],
     cwd: Path,
+    append: bool = False,
 ) -> subprocess.Popen:
     """Open launch files and spawn agy outside the asyncio event loop."""
-    with transcript_file.open("wb") as tout, stderr_log.open("wb") as terr:
+    mode = "ab" if append else "wb"
+    with (
+        prompt_file.open("rb") as pin,
+        transcript_file.open(mode) as tout,
+        stderr_log.open(mode) as terr,
+    ):
         return subprocess.Popen(
             argv,
-            stdin=subprocess.DEVNULL,
+            stdin=pin,
             stdout=tout,
             stderr=terr,
             env=env,
@@ -302,8 +377,9 @@ class AntigravityCliDeployer(BaseAgentDeployer):
         wd = Path(self.executor.work_dir)
         wd.mkdir(parents=True, exist_ok=True)
 
-        # 3. inject the OAuth credential the operator produced on the host.
-        self._write_oauth_token()
+        # 3. inject the OAuth credential unless using direct/proxy Gemini API.
+        if cfg.provider != "gemini":
+            self._write_oauth_token()
 
         # 4. cua GUI bridge + agy config. Idempotent bridge install.
         from ale_run.agents._bootstrap import cua_bridge_env, ensure_cua_mcp_server
@@ -322,6 +398,63 @@ class AntigravityCliDeployer(BaseAgentDeployer):
                 "env": cua_bridge_env(self.executor),
             },
         }
+        # agy >= 1.1 reads CLI policy from its own app-data directory. Keep the
+        # permission mode explicit even though launch also passes the one-run
+        # override; this prevents artifact/tool review prompts in headless mode.
+        settings: dict[str, object] = {
+            "toolPermission": (
+                "always-proceed" if cfg.dangerously_skip_permissions else "request-review"
+            ),
+            "artifactReviewPolicy": (
+                "always-proceed" if cfg.dangerously_skip_permissions else "asks-for-review"
+            ),
+        }
+        if cfg.provider == "gemini":
+            settings.update(
+                {
+                    "modelProvider": "gemini",
+                    "allowNonWorkspaceAccess": True,
+                    "disableSlashCommands": True,
+                    "showFeedbackSurvey": False,
+                }
+            )
+            if cfg.model:
+                settings["customModelsConfig"] = {
+                    "customModels": {
+                        cfg.model: {
+                            "modelName": cfg.model,
+                            "apiProvider": "API_PROVIDER_GOOGLE_GEMINI",
+                            "toolFormatterType": "TOOL_FORMATTER_TYPE_NONE",
+                        }
+                    }
+                }
+        cli_app_dir = gemini_home / "antigravity-cli"
+        cli_app_dir.mkdir(parents=True, exist_ok=True)
+        (cli_app_dir / "settings.json").write_text(
+            json.dumps(settings, indent=2),
+            encoding="utf-8",
+        )
+        if cfg.provider == "gemini":
+            onboarding_payload = json.dumps({"completed": True})
+            (cli_app_dir / "onboarding.json").write_text(
+                onboarding_payload,
+                encoding="utf-8",
+            )
+            cache_dir = cli_app_dir / "cache"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            (cache_dir / "onboarding.json").write_text(
+                onboarding_payload,
+                encoding="utf-8",
+            )
+
+        # 5. Windows: pre-warm node + the cua bridge modules BEFORE activating
+        #    mcp_config.json so ``agy models`` does not spawn an MCP stdio child
+        #    and exit mid-handshake.
+        if self._is_windows:
+            self._ensure_grep_windows()
+            await self._prewarm_bridge(sandbox)
+            await self._prewarm_agy()
+
         # agy reads its MCP servers from ~/.gemini/config/mcp_config.json (its
         # NATIVE config), NOT the gemini-cli settings.json — that is where the
         # cua GUI tools (screenshot/click/type/…) must be declared to load.
@@ -331,38 +464,9 @@ class AntigravityCliDeployer(BaseAgentDeployer):
             json.dumps({"mcpServers": cua_server}, indent=2),
             encoding="utf-8",
         )
-        # agy >= 1.1 reads CLI policy from its own app-data directory. Keep the
-        # permission mode explicit even though launch also passes the one-run
-        # override; this prevents artifact/tool review prompts in headless mode.
-        settings = {
-            "toolPermission": (
-                "always-proceed" if cfg.dangerously_skip_permissions else "request-review"
-            ),
-            "artifactReviewPolicy": (
-                "always-proceed" if cfg.dangerously_skip_permissions else "asks-for-review"
-            ),
-        }
-        cli_app_dir = gemini_home / "antigravity-cli"
-        cli_app_dir.mkdir(parents=True, exist_ok=True)
-        (cli_app_dir / "settings.json").write_text(
-            json.dumps(settings, indent=2),
-            encoding="utf-8",
-        )
         logger.info(
             "antigravity_cli: config staged at %s (cua -> config/mcp_config.json)", gemini_home
         )
-
-        # 5. Windows: pre-warm node + the cua bridge modules. A COLD node start
-        #    on Windows (Defender scan + ESM module load of the MCP SDK) is slow
-        #    enough to intermittently miss agy's MCP tool-discovery window at
-        #    launch, so the cua GUI tools register only ~1 run in 4. One warm-up
-        #    run loads the modules into the OS file cache and lets Defender scan
-        #    them once, so agy's spawn of the bridge at launch is fast and wins
-        #    the race. (Linux node start is fast; no warm-up needed there.)
-        if self._is_windows:
-            self._ensure_grep_windows()
-            await self._prewarm_bridge(sandbox)
-            await self._prewarm_agy()
 
     def _ensure_grep_windows(self) -> None:
         """Put ``grep`` on PATH for agy's ``grep_search`` tool.
@@ -422,8 +526,12 @@ class AntigravityCliDeployer(BaseAgentDeployer):
         """
         # gemini_dir is a global flag. agy 1.1.25 rejects it when it appears
         # after the subcommand (``agy models --gemini_dir=...``).
+        cfg: AntigravityCliConfig = self.config  # type: ignore[assignment]
         argv = [self._agy_path, f"--gemini_dir={self._gemini_dir}", "models"]
         env = self._without_credential_transport(os.environ.copy())
+        env["AGY_CLI_DISABLE_AUTO_UPDATE"] = "1"
+        if cfg.provider == "gemini":
+            self._apply_gemini_provider_env(cfg, env)
         try:
             await asyncio.to_thread(
                 subprocess.run,
@@ -516,11 +624,12 @@ class AntigravityCliDeployer(BaseAgentDeployer):
         wd.mkdir(parents=True, exist_ok=True)
 
         prompt_file = wd / "prompt.txt"
+        resume_prompt_file = wd / "resume_prompt.txt"
         transcript_file = wd / "transcript.jsonl"
         stderr_log = wd / "stderr.log"
         agy_log = wd / "agy_cli.log"
         pid_file = wd / "agy.pid"
-        for f in (transcript_file, stderr_log, agy_log, pid_file):
+        for f in (resume_prompt_file, transcript_file, stderr_log, agy_log, pid_file):
             if f.exists():
                 try:
                     f.unlink()
@@ -528,90 +637,187 @@ class AntigravityCliDeployer(BaseAgentDeployer):
                     pass
         prompt_file.write_text(prompt, encoding="utf-8")
 
-        # agy's print flag consumes its argument; unlike Gemini CLI, a lone
-        # hyphen means the literal prompt "-" rather than "read stdin".
-        argv = [self._agy_path, f"--print={prompt}"]
         # Pin the gemini dir to an ABSOLUTE path: agy resolves a relative
         # ".gemini" against CWD on Windows and falls back to a default, which
         # makes config discovery (incl. the cua MCP server) non-deterministic.
         gemini_dir = getattr(self, "_gemini_dir", "")
-        if gemini_dir:
-            argv.append(f"--gemini_dir={gemini_dir}")
-        # Give every task its own native agy log. Copying agy's global cli.log
-        # symlink after exit races under concurrency and can capture a different
-        # task's log. Direct logging also lets the lifecycle incrementally pull
-        # this file while the task is still running.
-        argv.append(f"--log-file={agy_log}")
-        if cfg.model:
-            argv += ["--model", cfg.model]
-        argv += ["--output-format", "stream-json"]
-        # Raise agy's print-mode timeout well above the wall budget — its 5m
-        # default silently truncates longer tasks (no output written).
-        if getattr(cfg, "print_timeout", ""):
-            argv.append(f"--print-timeout={cfg.print_timeout}")
-        if cfg.dangerously_skip_permissions:
-            argv.append("--dangerously-skip-permissions")
-        # agy file tools reject paths outside the workspace; add the task data
-        # root (outside cwd) as an extra workspace dir.
         task_data_root = getattr(self.executor.sandbox, "task_data_root", "")
-        if task_data_root:
-            argv += ["--add-dir", task_data_root]
+
+        def _build_argv(
+            *,
+            log_path: Path,
+            prompt_is_empty: bool,
+            conv_id: str | None = None,
+        ) -> list[str]:
+            # Feed non-empty prompts via stdin (prompt_file) with no --print
+            # flag so task instructions never appear in argv / /proc/cmdline
+            # where agent-run pkill -f commands could match and self-kill agy.
+            argv = [self._agy_path]
+            if prompt_is_empty:
+                argv.append("--print=")
+            if gemini_dir:
+                argv.append(f"--gemini_dir={gemini_dir}")
+            # Give every task its own native agy log. Copying agy's global
+            # cli.log symlink after exit races under concurrency and can capture
+            # a different task's log.
+            argv.append(f"--log-file={log_path}")
+            if conv_id:
+                argv += ["--conversation", conv_id]
+            if cfg.model:
+                argv += ["--model", cfg.model]
+            if cfg.effort and "2.5" not in (cfg.model or "").lower():
+                argv += ["--effort", cfg.effort]
+            argv += ["--output-format", "stream-json"]
+            # Raise agy's print-mode timeout well above the wall budget — its 5m
+            # default silently truncates longer tasks (no output written).
+            if getattr(cfg, "print_timeout", ""):
+                argv.append(f"--print-timeout={cfg.print_timeout}")
+            if cfg.dangerously_skip_permissions:
+                argv.append("--dangerously-skip-permissions")
+            if cfg.provider == "gemini":
+                argv.append("--disable-slash-commands")
+            # agy file tools reject paths outside the workspace; explicitly add
+            # wd and the task data root (outside cwd) as allowed workspace dirs.
+            argv += ["--add-dir", str(wd)]
+            if task_data_root and str(task_data_root) != str(wd):
+                argv += ["--add-dir", task_data_root]
+            return argv
 
         env = os.environ.copy()
         for k, v in (self.executor.env or {}).items():
             env[k] = v
         env["NO_COLOR"] = "1"
         env["TERM"] = "dumb"
+        env["AGY_CLI_DISABLE_AUTO_UPDATE"] = "1"
+        env["GEMINI_CLI_TRUST_WORKSPACE"] = "true"
         # The OAuth credential reaches agy via the file written in install(), NOT
         # the env. Strip the transport vars so the long-lived refresh token never
         # enters agy's process env (and thus any shell command the agent runs).
         self._without_credential_transport(env)
+        if cfg.provider == "gemini":
+            self._apply_gemini_provider_env(cfg, env)
+
         logger.info(
             "antigravity_cli: launching agy (model=%r, prompt_chars=%d, stream_json=true)",
             cfg.model,
             len(prompt),
         )
 
+        max_retries = max(0, int(getattr(cfg, "max_api_retries", 0) or 0))
         t0 = time.monotonic()
-        proc = await asyncio.to_thread(
-            _spawn_agy,
-            argv,
-            transcript_file=transcript_file,
-            stderr_log=stderr_log,
-            env=env,
-            cwd=wd,
-        )
-        pid_file.write_text(str(proc.pid), encoding="ascii")
-        logger.info("antigravity_cli: spawned pid=%s", proc.pid)
+        last_pid: int | None = None
+        exit_code: int | None = None
+        status = "failed"
+        error: str | None = None
 
-        try:
-            while proc.poll() is None:
-                await asyncio.sleep(_POLL_INTERVAL_S)
-        except asyncio.CancelledError:
-            self._terminate_proc_group(proc, force=False)
+        for attempt in range(max_retries + 1):
+            conv_id: str | None = None
+            active_prompt_file = prompt_file
+            append_mode = False
+            attempt_log = agy_log
+            prompt_is_empty = not bool(prompt)
+
+            if attempt > 0:
+                conv_id = _read_conversation_id(transcript_file)
+                if conv_id:
+                    resume_prompt_file.write_text(_RESUME_PROMPT, encoding="utf-8")
+                    active_prompt_file = resume_prompt_file
+                    append_mode = True
+                    attempt_log = wd / f"agy_cli_attempt_{attempt}.log"
+                    prompt_is_empty = False
+                else:
+                    for f in (transcript_file, stderr_log, agy_log):
+                        if f.exists():
+                            try:
+                                f.unlink()
+                            except OSError:
+                                pass
+
+            argv = _build_argv(
+                log_path=attempt_log,
+                prompt_is_empty=prompt_is_empty,
+                conv_id=conv_id,
+            )
+            tx_offset = (
+                transcript_file.stat().st_size
+                if append_mode and transcript_file.exists()
+                else 0
+            )
+            proc = await asyncio.to_thread(
+                _spawn_agy,
+                argv,
+                prompt_file=active_prompt_file,
+                transcript_file=transcript_file,
+                stderr_log=stderr_log,
+                env=env,
+                cwd=wd,
+                append=append_mode,
+            )
+            last_pid = proc.pid
+            pid_file.write_text(str(proc.pid), encoding="ascii")
+            logger.info(
+                "antigravity_cli: spawned pid=%s (attempt=%d/%d, conv_id=%r)",
+                proc.pid,
+                attempt + 1,
+                max_retries + 1,
+                conv_id,
+            )
+
             try:
-                await asyncio.wait_for(asyncio.to_thread(proc.wait), timeout=_TERM_GRACE_S)
-            except (TimeoutError, asyncio.CancelledError):
-                self._terminate_proc_group(proc, force=True)
-            raise
+                while proc.poll() is None:
+                    await asyncio.sleep(_POLL_INTERVAL_S)
+            except asyncio.CancelledError:
+                self._terminate_proc_group(proc, force=False)
+                try:
+                    await asyncio.wait_for(asyncio.to_thread(proc.wait), timeout=_TERM_GRACE_S)
+                except (TimeoutError, asyncio.CancelledError):
+                    self._terminate_proc_group(proc, force=True)
+                raise
+            finally:
+                if attempt_log != agy_log and attempt_log.exists():
+                    try:
+                        with agy_log.open("ab") as dst, attempt_log.open("rb") as src:
+                            shutil.copyfileobj(src, dst)
+                        attempt_log.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+
+            exit_code = proc.returncode
+            native_result = _read_result_envelope(transcript_file, offset=tx_offset)
+            native_status = str((native_result or {}).get("status") or "").upper()
+            status = "completed" if exit_code == 0 and native_status == "SUCCESS" else "failed"
+            error = None
+            if status == "failed":
+                native_error = (native_result or {}).get("error")
+                if native_status and native_status != "SUCCESS" and native_error:
+                    error = f"agy result status={native_status}: {_json_text(native_error)}"
+                elif exit_code == 0 and native_status != "SUCCESS":
+                    error = "agy exited without a terminal SUCCESS result"
+                else:
+                    error = self._diagnose_failure(stderr_log, transcript_file, exit_code)
+
+                if (
+                    attempt < max_retries
+                    and exit_code not in (-9, -15, 137, 143)
+                    and _is_retryable_failure(error, stderr_log, agy_log)
+                ):
+                    delay_s = min(_RETRY_BACKOFF_BASE_S * (2**attempt), 60.0)
+                    logger.warning(
+                        "antigravity_cli: retryable failure on attempt %d/%d "
+                        "(retrying in %.1fs): %s",
+                        attempt + 1,
+                        max_retries + 1,
+                        delay_s,
+                        error,
+                    )
+                    await asyncio.sleep(delay_s)
+                    continue
+            break
 
         duration_s = time.monotonic() - t0
-        exit_code = proc.returncode
-        native_result = _read_result_envelope(transcript_file)
-        native_status = str((native_result or {}).get("status") or "").upper()
-        status = "completed" if exit_code == 0 and native_status == "SUCCESS" else "failed"
-        error: str | None = None
-        if status == "failed":
-            native_error = (native_result or {}).get("error")
-            if native_status and native_status != "SUCCESS" and native_error:
-                error = f"agy result status={native_status}: {_json_text(native_error)}"
-            elif exit_code == 0 and native_status != "SUCCESS":
-                error = "agy exited without a terminal SUCCESS result"
-            else:
-                error = self._diagnose_failure(stderr_log, transcript_file, exit_code)
         return AgentRunResult(
             status=status,
-            pid=proc.pid,
+            pid=last_pid,
             exit_code=exit_code,
             transcript_path=str(transcript_file),
             stderr_path=str(stderr_log),
@@ -641,6 +847,32 @@ class AntigravityCliDeployer(BaseAgentDeployer):
         for name in _CREDENTIAL_TRANSPORT_VARS:
             env.pop(name, None)
         return env
+
+    @staticmethod
+    def _apply_gemini_provider_env(cfg: AntigravityCliConfig, env: dict[str, str]) -> None:
+        """Populate Gemini API / sidecar proxy routing env vars."""
+        env["GEMINI_API_KEY"] = (
+            cfg.api_key
+            or env.get("GEMINI_API_KEY")
+            or env.get("GOOGLE_API_KEY")
+            or "unused"
+        )
+        if cfg.base_url:
+            env["GOOGLE_GEMINI_BASE_URL"] = cfg.base_url
+            proxy_host = urllib.parse.urlparse(cfg.base_url).hostname or ""
+            no_proxy_hosts = ["localhost", "127.0.0.1"]
+            if proxy_host and proxy_host not in no_proxy_hosts:
+                no_proxy_hosts.append(proxy_host)
+            for proxy_var in ("NO_PROXY", "no_proxy"):
+                existing = [
+                    host.strip()
+                    for host in env.get(proxy_var, "").split(",")
+                    if host.strip()
+                ]
+                for host in no_proxy_hosts:
+                    if host not in existing:
+                        existing.append(host)
+                env[proxy_var] = ",".join(existing)
 
     # =========================================================================
     # internals
@@ -989,9 +1221,16 @@ def _json_text(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
-def _read_result_envelope(path: Path) -> dict | None:
-    """Return the last native result record, tolerating partial JSONL tails."""
-    for line in reversed(_read_text_tolerant(path).splitlines()):
+def _read_result_envelope(path: Path, *, offset: int = 0) -> dict | None:
+    """Return the last native result record after ``offset`` bytes."""
+    try:
+        with path.open("rb") as stream:
+            if offset > 0:
+                stream.seek(offset)
+            text = stream.read().decode("utf-8", errors="replace")
+    except (FileNotFoundError, OSError):
+        return None
+    for line in reversed(text.splitlines()):
         try:
             record = json.loads(_strip_ansi(line))
         except json.JSONDecodeError:
@@ -1004,3 +1243,45 @@ def _read_result_envelope(path: Path) -> dict | None:
         if any(key in record for key in ("response", "status", "usage")):
             return record
     return None
+
+
+def _read_conversation_id(path: Path) -> str | None:
+    """Extract the most recent conversation_id from agy's stream-json output."""
+    for line in reversed(_read_text_tolerant(path).splitlines()):
+        try:
+            record = json.loads(_strip_ansi(line))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        for candidate in (
+            record.get("conversation_id"),
+            (record.get("result") if isinstance(record.get("result"), dict) else {}).get(
+                "conversation_id"
+            ),
+            (
+                record.get("step_update")
+                if isinstance(record.get("step_update"), dict)
+                else {}
+            ).get("conversation_id"),
+            (record.get("init") if isinstance(record.get("init"), dict) else {}).get(
+                "conversation_id"
+            ),
+        ):
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+    return None
+
+
+def _is_retryable_failure(error: str | None, stderr_log: Path, agy_log: Path) -> bool:
+    """Return True if a failed turn aborted on a transient error or token cap."""
+    haystack = "\n".join(
+        (
+            error or "",
+            _read_text_tolerant(stderr_log)[-4000:],
+            _read_text_tolerant(agy_log)[-4000:],
+        )
+    ).lower()
+    if any(marker in haystack for marker in _NON_RETRYABLE_ERROR_SUBSTRINGS):
+        return False
+    return any(marker in haystack for marker in _RETRYABLE_ERROR_SUBSTRINGS)
