@@ -202,6 +202,27 @@ def _is_accelerator_machine_type(machine_type: str) -> bool:
 # Machine-type fallback chain
 # ============================================================================
 
+_SUPPORTED_CPU_MACHINE_FAMILIES = frozenset({"c4", "n2"})
+
+
+def _normalize_cpu_machine_family(raw: Any) -> str | None:
+    """Normalize an optional CPU machine-family override ('c4' or 'n2')."""
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise TypeError(
+            f"cpu_machine_family must be a string ('c4' or 'n2'), got {type(raw).__name__}"
+        )
+    val = raw.strip().lower()
+    if not val:
+        return None
+    if val not in _SUPPORTED_CPU_MACHINE_FAMILIES:
+        raise ValueError(
+            f"cpu_machine_family must be one of {sorted(_SUPPORTED_CPU_MACHINE_FAMILIES)}, "
+            f"got {raw!r}"
+        )
+    return val
+
 
 def _cpu_family_fallback(machine_type: str) -> str | None:
     """C-family → N2 fallback, keeping the ``type-size`` suffix.
@@ -216,18 +237,34 @@ def _cpu_family_fallback(machine_type: str) -> str | None:
     return None
 
 
-def _machine_chain(machine_type: str, *, is_gpu: bool) -> tuple[str, ...]:
+def _machine_chain(
+    machine_type: str,
+    *,
+    is_gpu: bool,
+    cpu_machine_family: str | None = None,
+) -> tuple[str, ...]:
     """Ordered machine types to try for one VM.
 
     * GPU: just the requested G-family machine — no machine-type fallback.
-    * CPU: the requested machine, then its N2 fallback (``c*`` → ``n2-*``).
+    * CPU:
+      - ``cpu_machine_family=None`` (default): the requested machine, then its
+        N2 fallback (``c*`` → ``n2-*``).
+      - ``cpu_machine_family="n2"``: directly use the N2 counterpart for
+        C-family CPU machines (skipping C-family attempts entirely).
+      - ``cpu_machine_family="c4"``: restrict C-family CPU machines to C4
+        without falling back to N2.
 
     Zone fallback (across the snapshot's zone list) is orthogonal and
     applied by the caller for each machine in this chain.
     """
     if is_gpu:
         return (machine_type,)
+    family = _normalize_cpu_machine_family(cpu_machine_family)
     fb = _cpu_family_fallback(machine_type)
+    if family == "n2":
+        return (fb,) if fb else (machine_type,)
+    if family == "c4":
+        return (machine_type,)
     return (machine_type, fb) if fb else (machine_type,)
 
 
@@ -327,7 +364,17 @@ class GcloudProviderConfig:
     unauthenticated) so in-VM staging + gs:// pulls work; the key's project_id
     also bills requester-pays buckets via gsutil ``-u``. Mirrors the docker
     provider's same-named knob."""
+    cpu_machine_family: str | None = None
+    """Optional CPU machine-family override ('c4' or 'n2'). None preserves the
+    default C→N2 fallback chain; 'n2' maps C-family CPU tasks directly to N2."""
     snapshots: dict[str, SnapshotConfig] = dataclass_field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "cpu_machine_family",
+            _normalize_cpu_machine_family(self.cpu_machine_family),
+        )
 
 
 def _build_snapshot_config(raw: Any) -> SnapshotConfig:
@@ -370,6 +417,9 @@ def _build_provider_config(raw: dict[str, Any]) -> GcloudProviderConfig:
         str(tag): _build_snapshot_config(entry)
         for tag, entry in (raw.get("snapshots") or {}).items()
     }
+    raw_cpu_family = raw.get("cpu_machine_family")
+    if raw_cpu_family is None:
+        raw_cpu_family = os.environ.get("ALE_CPU_MACHINE_FAMILY")
     return GcloudProviderConfig(
         project=str(raw["project"]),
         service_account_key=str(raw["service_account_key"]),
@@ -377,6 +427,7 @@ def _build_provider_config(raw: dict[str, Any]) -> GcloudProviderConfig:
         network=str(raw.get("network") or "default"),
         subnet=str(raw.get("subnet") or "default"),
         gcs_sa_key=str(raw.get("gcs_sa_key") or ""),
+        cpu_machine_family=_normalize_cpu_machine_family(raw_cpu_family),
         snapshots=snapshots,
     )
 
@@ -843,7 +894,11 @@ class GcloudProvider(Provider):
         base_machine = spec.machine_type or (
             _DEFAULT_GPU_MACHINE if is_gpu else _DEFAULT_CPU_MACHINE
         )
-        machines = _machine_chain(base_machine, is_gpu=is_gpu)
+        machines = _machine_chain(
+            base_machine,
+            is_gpu=is_gpu,
+            cpu_machine_family=self._cfg.cpu_machine_family,
+        )
 
         name = generate_vm_name(
             self._cfg.instance_prefix,
