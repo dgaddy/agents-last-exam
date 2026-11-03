@@ -44,6 +44,14 @@ def main(argv: list[str] | None = None) -> int:
         help="Run every selected unit exactly once, without scanning prior "
              "results or automatically retrying failures.",
     )
+    p_run.add_argument(
+        "--cpu-machine-family",
+        type=str.lower,
+        choices=("c4", "n2"),
+        default=None,
+        help="Override GCE machine family for CPU task VMs ('n2' maps c* tasks "
+             "directly to n2-*; 'c4' pins c4 without n2 fallback).",
+    )
     p_run.add_argument("--verbose", "-v", action="store_true")
 
     p_list = subparsers.add_parser("list", help="List discoverable tasks.")
@@ -68,6 +76,10 @@ def main(argv: list[str] | None = None) -> int:
 
 async def _cmd_run(args: argparse.Namespace) -> int:
     spec = load_experiment(args.spec_path)
+    if args.cpu_machine_family and "gcloud" in spec.environment.provider_specs:
+        spec.environment.provider_specs["gcloud"].config["cpu_machine_family"] = (
+            args.cpu_machine_family
+        )
     runner = Runner(spec)
     units = _filter_units(runner.enumerate_units(), args)
 
