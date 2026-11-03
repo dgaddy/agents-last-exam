@@ -402,7 +402,10 @@ _ENVIRONMENT_TOP_RESERVED = frozenset({
 # gcloud connection fields that belong to the provider as a whole (vs the
 # per-snapshot routing fields image/zones/gpu). They are repeated on each gcloud
 # snapshot's block and reconciled here into one provider config.
-_GCLOUD_CRED_KEYS = ("project", "service_account_key", "instance_prefix", "network", "subnet")
+_GCLOUD_CRED_KEYS = (
+    "project", "service_account_key", "instance_prefix", "network", "subnet",
+    "cpu_machine_family",
+)
 _AWS_CRED_KEYS = (
     "region", "security_group", "instance_prefix",
     "key_name", "iam_instance_profile", "associate_public_ip",
