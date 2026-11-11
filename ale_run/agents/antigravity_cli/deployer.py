@@ -1028,6 +1028,23 @@ class AntigravityCliDeployer(BaseAgentDeployer):
         builder.trajectory.extra.setdefault("antigravity_cli", {}).update(metadata)
 
     @classmethod
+    def token_usage_records(
+        cls,
+        *,
+        work_dir: Path,
+        config: AntigravityCliConfig,
+        run_result: AgentRunResult,
+    ) -> list[dict] | None:
+        """One ledger record per agy model generation, from ``transcript.jsonl``."""
+        from .metrics import build_token_usage_records
+
+        return build_token_usage_records(
+            work_dir,
+            model=config.model or None,
+            provider=config.provider or None,
+        )
+
+    @classmethod
     def _consume_stream_steps(
         cls,
         native_events: list[dict],

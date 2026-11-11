@@ -451,6 +451,14 @@ async def run_one_unit(
                     "origin_log_gather_failed",
                     report={"transport": "?", "files": 0, "error": str(e)},
                 )
+            _write_token_usage_ledger(
+                writer=writer,
+                unit=unit,
+                deployer_cls=deployer_cls,
+                config=config,
+                run_result=run_result,
+                host_artifacts_dir=host_artifacts_dir,
+            )
             # ============================================================
             # Phase 3 — gather env output, stage reference, evaluate
             # ============================================================
@@ -679,6 +687,38 @@ async def run_one_unit(
 # ======================================================================
 # Helpers
 # ======================================================================
+
+
+def _write_token_usage_ledger(
+    *,
+    writer: RunWriter,
+    unit: RunUnit,
+    deployer_cls: Any,
+    config: Any,
+    run_result: AgentRunResult | None,
+    host_artifacts_dir: Path,
+) -> None:
+    """Write ``<run_dir>/token_usage.jsonl`` for this attempt. Never raises."""
+    from ..base_interface.token_usage import finalize_attempt_ledger
+
+    stream_records = None
+    try:
+        if run_result is not None:
+            stream_records = deployer_cls.token_usage_records(
+                work_dir=host_artifacts_dir, config=config, run_result=run_result,
+            )
+    except Exception as e:
+        logger.warning("token_usage_records failed for %s: %s", unit.slug, e)
+    path = finalize_attempt_ledger(
+        attempt_dir=writer.run_dir,
+        work_dir=host_artifacts_dir,
+        stream_records=stream_records,
+        task_id=unit.task_path,
+        attempt_id=writer.run_id,
+        agent_harness=unit.agent_spec.class_,
+    )
+    if path is not None:
+        writer.emit_event("token_usage_written", path=path.name)
 
 
 def _extract_score(eval_output: Any) -> float | None:

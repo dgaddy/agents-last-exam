@@ -22,6 +22,8 @@ from typing import Any, Awaitable, Callable, List, Literal, Tuple, TypeVar
 
 import litellm
 
+from ale_run.base_interface.token_usage import usage_scope
+
 # Set LiteLLM global request timeout and max retries from environment variables
 litellm.request_timeout = float(os.environ.get("LITELLM_REQUEST_TIMEOUT", "600.0"))
 litellm.num_retries = int(os.environ.get("LITELLM_MAX_RETRIES", "1000"))
@@ -170,7 +172,8 @@ async def call_with_retry_budget(
     while True:
         attempt += 1
         try:
-            return await coro_fn()
+            with usage_scope(call_site=label):
+                return await coro_fn()
         except BaseException as exc:
             if getattr(exc, "_retry_budget_exhausted", False):
                 raise

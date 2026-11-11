@@ -281,6 +281,102 @@ def _append_tool_execution(
         )
 
 
+def agy_usage(usage: dict[str, Any]) -> dict[str, int | None]:
+    """Map agy stream ``usage`` onto the token-usage ledger partition.
+
+    agy reports ``input_tokens`` disjoint from ``cache_read_tokens`` and an
+    ``output_tokens`` that already includes ``thinking_tokens``; it exposes no
+    cache-write count.
+    """
+    uncached = max(0, _int_or_none(usage.get("input_tokens")) or 0)
+    cached = max(0, _int_or_none(usage.get("cache_read_tokens")) or 0)
+    completion = max(0, _int_or_none(usage.get("output_tokens")) or 0)
+    thinking = _int_or_none(usage.get("thinking_tokens"))
+    reasoning = min(max(0, thinking), completion) if thinking is not None else None
+    return {
+        "prompt_tokens": uncached + cached,
+        "cached_tokens": cached,
+        "cache_write_tokens": 0,
+        "uncached_prompt_tokens": uncached,
+        "completion_tokens": completion,
+        "reasoning_tokens": reasoning,
+        "response_tokens": completion - reasoning if reasoning is not None else None,
+    }
+
+
+def build_token_usage_records(
+    work_dir: Path,
+    *,
+    model: str | None,
+    provider: str | None,
+) -> list[dict[str, Any]] | None:
+    """Rebuild one ledger record per agy model generation from ``transcript.jsonl``.
+
+    agy may emit several ``step_update`` events for one ``step_index`` that
+    restate the step's running usage, so each step keeps its largest usage.
+    A resumed conversation is appended to the same transcript after a new
+    ``init`` event; step indices are scoped per segment. Returns None when
+    the transcript is absent.
+    """
+    from ale_run.base_interface.token_usage import build_record
+
+    transcript_path = work_dir / "transcript.jsonl"
+    if not transcript_path.exists():
+        return None
+    segment = 0
+    observed_model: str | None = None
+    order: list[tuple[int, int]] = []
+    steps: dict[tuple[int, int], dict[str, Any]] = {}
+    for native in _iter_jsonl(transcript_path):
+        event_name = native.get("event")
+        if event_name == "init":
+            segment += 1
+            init = native.get("init")
+            if isinstance(init, dict) and isinstance(init.get("model"), str) and init["model"]:
+                observed_model = init["model"]
+            continue
+        if event_name != "step_update" or not isinstance(native.get("step_update"), dict):
+            continue
+        update = native["step_update"]
+        usage = update.get("usage")
+        step_index = _int_or_none(update.get("step_index"))
+        if not isinstance(usage, dict) or step_index is None:
+            continue
+        key = (segment, step_index)
+        size = sum(
+            _int_or_none(usage.get(field)) or 0
+            for field in ("input_tokens", "cache_read_tokens", "output_tokens")
+        )
+        previous = steps.get(key)
+        if previous is None:
+            order.append(key)
+        elif previous["size"] > size:
+            continue
+        steps[key] = {"size": size, "update": update, "usage": usage, "model": observed_model}
+
+    records: list[dict[str, Any]] = []
+    for key in order:
+        entry = steps[key]
+        update = entry["update"]
+        duration_ms = _duration_ms(update.get("duration_seconds"))
+        records.append(
+            build_record(
+                role="agent",
+                model=entry["model"] or model,
+                usage=agy_usage(entry["usage"]),
+                raw_usage=entry["usage"],
+                status="error" if update.get("state") == "ERROR" else "ok",
+                provider=provider,
+                api="agy-stream-json",
+                response_model=entry["model"],
+                latency_ms=float(duration_ms) if duration_ms is not None else None,
+                step=key[1],
+                call_site=str(update.get("step_type") or "") or None,
+            )
+        )
+    return records
+
+
 def _usage_totals(usage: dict[str, Any]) -> dict[str, int | None]:
     totals = {
         "input_tokens": _int_or_none(usage.get("input_tokens")),

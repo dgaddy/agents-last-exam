@@ -153,6 +153,12 @@ class AleClawDeployer(BaseAgentDeployer):
         trajectory_dir.mkdir(parents=True, exist_ok=True)
         logger.info("ale-claw: launch — work_dir=%s task_id=%s", work_dir, task_id)
 
+        # Per-call token usage ledger: every LiteLLM call in this process.
+        from ale_run.base_interface.token_usage import LEDGER_FILENAME
+
+        from .harness.model.usage_ledger import install_token_usage_callback
+        install_token_usage_callback(work_dir / LEDGER_FILENAME)
+
         # ---- 1. Drive-VM session (deployer-side, talks to eval cua-server) ----
         # In local executor this is host → VM RPC. In docker executor it's
         # container → VM RPC (container has --network host so endpoint reaches).

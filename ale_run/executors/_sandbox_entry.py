@@ -330,6 +330,9 @@ def run(spec: dict, env: dict | None = None) -> dict:
                 )
             )
         finally:
+            # Queued per-call usage records must land before the loop closes.
+            from ale_run.base_interface.token_usage import flush_pending
+            loop.run_until_complete(flush_pending())
             loop.close()
 
         return {

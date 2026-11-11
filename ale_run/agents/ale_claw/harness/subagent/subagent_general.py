@@ -23,6 +23,8 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from ale_run.base_interface.token_usage import usage_scope
+
 from .subagent_registry import SubagentRegistry, SubagentUsage
 from .subagent_session import (
     ALLOWED_TOOL_NAMES,
@@ -104,7 +106,8 @@ async def run_general_subagent(
             initial_screenshot_paths=initial_screenshot_paths,
         )
         registry.attach_inbox(run_id, session.inbox)
-        result_text = await session.run()
+        with usage_scope(role="subagent"):
+            result_text = await session.run()
         log_limit = 2000
         if len(result_text) > log_limit:
             shown = (

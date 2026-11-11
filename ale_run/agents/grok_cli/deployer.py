@@ -516,6 +516,65 @@ class GrokCliDeployer(BaseAgentDeployer):
         })
 
     @classmethod
+    def token_usage_records(
+        cls,
+        *,
+        work_dir: Path,
+        config: GrokCliConfig,
+        run_result: AgentRunResult,
+    ) -> list[dict] | None:
+        """One ledger record per grok-cli ``step_finish`` event.
+
+        grok-cli reports only aggregate ``inputTokens`` / ``outputTokens`` per
+        step, without a cache-read split or a reasoning breakdown, so those
+        ledger fields are null and consumers must treat the cache split as
+        unknown.
+        """
+        from ale_run.base_interface.token_usage import build_record
+
+        transcript_file = work_dir / "transcript.jsonl"
+        if not transcript_file.exists():
+            return None
+        records: list[dict] = []
+        for line in _read_text_tolerant(transcript_file).splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict) or event.get("type") != "step_finish":
+                continue
+            usage = event.get("usage")
+            if not isinstance(usage, dict) or not usage:
+                continue
+            input_tokens = usage.get("inputTokens")
+            output_tokens = usage.get("outputTokens")
+            cost_ticks = usage.get("costUsdTicks")
+            records.append(build_record(
+                role="agent",
+                model=config.model or None,
+                usage={
+                    "prompt_tokens": input_tokens if isinstance(input_tokens, int) else None,
+                    "cached_tokens": None,
+                    "cache_write_tokens": None,
+                    "uncached_prompt_tokens": None,
+                    "completion_tokens": output_tokens if isinstance(output_tokens, int) else None,
+                    "reasoning_tokens": None,
+                    "response_tokens": None,
+                },
+                raw_usage=usage,
+                status="error" if event.get("finishReason") == "error" else "ok",
+                provider="xai",
+                api="grok-cli-stream-json",
+                cost_usd=(cost_ticks / 1_000_000) if isinstance(cost_ticks, (int, float)) else None,
+                step=event.get("stepNumber") if isinstance(event.get("stepNumber"), int) else None,
+                call_site="step_finish",
+            ))
+        return records
+
+    @classmethod
     def _consume_event(cls, event: dict, builder: TrajectoryBuilder) -> None:
         etype = event.get("type")
         if etype == "text":

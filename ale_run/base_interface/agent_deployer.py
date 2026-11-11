@@ -157,6 +157,25 @@ class BaseAgentDeployer(abc.ABC):
 
     # ---- optional metadata ----
 
+    @classmethod
+    def token_usage_records(
+        cls,
+        *,
+        work_dir: Path,
+        config: Any,
+        run_result: AgentRunResult,
+    ) -> list[dict[str, Any]] | None:
+        """Per-model-call usage records rebuilt from ``work_dir`` artifacts.
+
+        Override for harnesses whose model calls cannot be observed in
+        process (e.g. CLIs running in the task VM); records are built with
+        :func:`ale_run.base_interface.token_usage.build_record`. Runs on the
+        framework host after gather. Return None when the harness does not
+        expose per-call usage. In-process harnesses instead append to
+        ``<work_dir>/token_usage.jsonl`` while they run.
+        """
+        return None
+
     @property
     def version(self) -> str | None:
         """CLI / SDK version string surfaced in run.json + trajectory.agent.version.

@@ -29,6 +29,8 @@ from typing import Any
 from agent import ComputerAgent
 from agent.callbacks.base import AsyncCallbackHandler
 
+from ale_run.base_interface.token_usage import usage_scope
+
 from ..memory.memory import MemoryGetTool, MemorySearchTool, MemoryStore, MemoryWriteTool
 from ..tools.computer_handler import (
     OpenClawComputerHandler,
@@ -431,10 +433,11 @@ async def run_gui_subagent(
     registry.attach_inbox(run_id, inbox)
 
     try:
-        agent = await _build_gui_agent(session, model, thinking_params, memory_store, inbox)
-        summary = await _relay_until_done(
-            agent, instruction, run_id, max_steps, usage, transcript
-        )
+        with usage_scope(role="subagent"):
+            agent = await _build_gui_agent(session, model, thinking_params, memory_store, inbox)
+            summary = await _relay_until_done(
+                agent, instruction, run_id, max_steps, usage, transcript
+            )
         registry.complete(run_id, summary, usage)
         return summary
 
