@@ -24,6 +24,11 @@ logger = logging.getLogger(__name__)
 # Other states (failed / cancelled / not_executed) are re-run.
 _RESUME_DONE_STATUSES = frozenset({"completed", "timeout"})
 
+# Exit status of ``ale run`` when the judge preflight fails. No unit was started
+# and no result was written, which a wrapper cannot tell from status 1 (some
+# units did not complete) without its own exit status.
+EXIT_JUDGE_PREFLIGHT_FAILED = 3
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
@@ -106,10 +111,21 @@ async def _cmd_run(args: argparse.Namespace) -> int:
             print(f"  {u.agent_id:20s}  {u.task_path:40s}  v{u.variant_index}")
         return 0
 
-    results = await runner.run(
-        units,
-        max_attempts=spec.max_attempts if auto_resume else 1,
-    )
+    try:
+        results = await runner.run(
+            units,
+            max_attempts=spec.max_attempts if auto_resume else 1,
+        )
+    except Exception as error:
+        # Only the judge preflight lets this escape Runner.run; a judge failure
+        # while scoring a unit is recorded on that unit instead.
+        from tasks.utils.evaluation import JudgeInfrastructureError
+
+        if not isinstance(error, JudgeInfrastructureError):
+            raise
+        logger.error("%s", error)
+        print(f"Judge preflight failed; none of the {len(units)} selected unit(s) ran.")
+        return EXIT_JUDGE_PREFLIGHT_FAILED
     _print_results_table(results)
     bad = sum(1 for r in results if r.status not in ("completed",))
     return 0 if bad == 0 else 1

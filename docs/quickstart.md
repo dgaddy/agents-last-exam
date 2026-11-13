@@ -30,6 +30,13 @@ tools, deferred evaluator imports, and all 122 active task entry points without
 starting VMs or contacting judges. The runner repeats host checks before its
 Judge preflight; `--dry-run` remains a configuration-only preview.
 
+A failed Judge preflight starts no sandbox, writes no result, and makes
+`ale run` exit with status 3. The probe runs once by default; set
+`ALE_JUDGE_PREFLIGHT_ATTEMPTS` (and optionally
+`ALE_JUDGE_PREFLIGHT_RETRY_DELAY_S`, default 30, doubled per retry) to retry
+through a brief judge outage. Requests the judge rejects outright (HTTP 4xx
+other than 408, 409 and 429) are not retried.
+
 The host's `gcloud` login creates and deletes VMs. A separate service-account
 key is injected into each sandbox for Cloud Storage.
 
