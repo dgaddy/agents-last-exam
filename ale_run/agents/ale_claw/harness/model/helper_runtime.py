@@ -50,8 +50,14 @@ async def call_helper_model(
             **(thinking_params or {}),
             **connection_kwargs,
         }
-        if timeout is not None:
-            kwargs["timeout"] = timeout
+        kwargs["timeout"] = (
+            timeout
+            if timeout is not None
+            else float(os.environ.get("LITELLM_REQUEST_TIMEOUT", "1800.0"))
+        )
+        kwargs["num_retries"] = int(
+            os.environ.get("LITELLM_MAX_RETRIES", "2")
+        )
         if tools:
             kwargs["tools"] = [_to_responses_function_tool(tool) for tool in tools]
         response = await call_with_retry_budget(
@@ -73,8 +79,12 @@ async def call_helper_model(
         **(thinking_params or {}),
         **connection_kwargs,
     }
-    if timeout is not None:
-        kwargs["timeout"] = timeout
+    kwargs["timeout"] = (
+        timeout
+        if timeout is not None
+        else float(os.environ.get("LITELLM_REQUEST_TIMEOUT", "1800.0"))
+    )
+    kwargs["num_retries"] = int(os.environ.get("LITELLM_MAX_RETRIES", "2"))
     if tools:
         kwargs["tools"] = tools
     response = await call_with_retry_budget(
@@ -82,15 +92,24 @@ async def call_helper_model(
         label=f"helper:{purpose}({resolved.model})",
     )
     record_helper_usage(response, model=resolved.model, purpose=purpose)
-    choice = response.choices[0]
+    choices = getattr(response, "choices", None) or []
+    if not choices:
+        return HelperCallResult(text="", tool_calls=[])
+    choice = choices[0]
+    msg = getattr(choice, "message", None)
+    if msg is None:
+        return HelperCallResult(text="", tool_calls=[])
+    text_val = (getattr(msg, "content", None) or "").strip()
+    if not text_val and purpose == "compaction":
+        text_val = (getattr(msg, "reasoning_content", None) or "").strip()
     return HelperCallResult(
-        text=(choice.message.content or "").strip(),
+        text=text_val,
         tool_calls=[
             {
                 "name": tool_call.function.name,
                 "arguments": tool_call.function.arguments,
             }
-            for tool_call in (choice.message.tool_calls or [])
+            for tool_call in (getattr(msg, "tool_calls", None) or [])
         ],
     )
 

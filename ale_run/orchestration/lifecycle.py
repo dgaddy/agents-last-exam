@@ -617,6 +617,7 @@ async def run_one_unit(
             # ============================================================
             # Lifecycle status promotion (LOG_SPEC §4)
             # ============================================================
+            _agent_phase_failure = False
             if eval_status == "failed":
                 status = "failed"
                 error_str = (eval_error or {}).get("message", "evaluation failed")
@@ -624,14 +625,21 @@ async def run_one_unit(
             elif run_result is not None and run_result.status == "timeout":
                 status = "timeout"
                 error_str = run_result.error
+                _agent_phase_failure = True
             elif run_result is not None and run_result.status == "failed":
                 status = "failed"
                 error_str = run_result.error or "agent failed"
+                _err_type = (
+                    "empty_response_loop"
+                    if error_str.startswith("empty_response_loop")
+                    else "Exception"
+                )
                 error_obj = {
-                    "type": "Exception",
+                    "type": _err_type,
                     "message": error_str,
                     "traceback": error_str,
                 }
+                _agent_phase_failure = True
             elif eval_status == "timeout":
                 status = "timeout"
                 error_str = (eval_error or {}).get("message", "evaluation timed out")
@@ -640,9 +648,9 @@ async def run_one_unit(
                 status = "completed"
 
             phase = (
-                "agent_run" if status == "timeout" and run_result is not None
-                and run_result.status == "timeout"
-                else env.current_phase if status != "completed" else None
+                "agent_run"
+                if _agent_phase_failure
+                else (env.current_phase if status != "completed" else None)
             )
 
         finally:
@@ -676,6 +684,67 @@ async def run_one_unit(
         logger.exception("run_one_unit failed for %s", unit.slug)
 
     finally:
+        # Reported duration = actual execution window (sem-acquired → eval start),
+        # excluding the concurrency-queue wait and the eval phase. Fall back
+        # gracefully for paths that fail before exec start or before eval.
+        _exec_start = exec_started if exec_started is not None else started
+        _exec_end = exec_ended if exec_ended is not None else time.monotonic()
+        total_s = round(_exec_end - _exec_start, 2)
+        # Diagnostics: how long this unit waited in the concurrency queue.
+        queue_wait_s = round(_exec_start - started, 2)
+
+        # ---- Finalize the three terminal files + the run_completed event BEFORE VM cleanup ----
+        try:
+            writer.write_eval_result(
+                eval_status=eval_status,
+                score=score,
+                eval_duration_s=eval_duration_s,
+                error=eval_error,
+            )
+
+            cli_identity: dict[str, Any] = {}
+            if host_artifacts_dir is not None:
+                try:
+                    loaded = json.loads((host_artifacts_dir / "_cli_identity.json").read_text())
+                    if isinstance(loaded, dict):
+                        version = loaded.get("cli_version")
+                        source = loaded.get("source")
+                        cli_identity = {
+                            "cli_version": version if isinstance(version, str) else None,
+                            "source": source if isinstance(source, str) and source in {"official", "fork", "custom"} else None,
+                        }
+                except (OSError, ValueError):
+                    pass
+            run_meta = _build_run_meta(
+                run_id=writer.run_id,
+                unit=unit,
+                config=config,
+                executor_type=executor_type,
+                status=status,
+                score=score,
+                phase=phase,
+                error_obj=error_obj,
+                error_str=error_str,
+                total_s=total_s,
+                trajectory=trajectory,
+                category=_category_from_error(error_str),
+                task_revision_value=task_revision_value,
+                environment=environment_metadata,
+                cli_identity=cli_identity,
+            )
+            writer.write_run_json(run_meta)
+
+            writer.emit_event(
+                "run_completed",
+                status=status,
+                score=score,
+                total_duration_s=total_s,
+                queue_wait_s=queue_wait_s,
+            )
+            writer.close()
+        except Exception as e:
+            logger.exception("Failed to write terminal result files for %s: %s", unit.slug, e)
+
         # Phase 4 — cleanup. Both branches are best-effort; never raise here.
         if task_driver is not None:
             try:
@@ -684,67 +753,12 @@ async def run_one_unit(
                 logger.debug("TaskDriver.close failed: %s", e)
         if env is not None:
             try:
-                await env.close_async(mode=effective_cleanup_mode)
+                await asyncio.wait_for(
+                    env.close_async(mode=effective_cleanup_mode),
+                    timeout=1800.0,
+                )
             except Exception as e:
-                logger.debug("ALEEnv.close_async failed: %s", e)
-
-    # Reported duration = actual execution window (sem-acquired → eval start),
-    # excluding the concurrency-queue wait and the eval phase. Fall back
-    # gracefully for paths that fail before exec start or before eval.
-    _exec_start = exec_started if exec_started is not None else started
-    _exec_end = exec_ended if exec_ended is not None else time.monotonic()
-    total_s = round(_exec_end - _exec_start, 2)
-    # Diagnostics: how long this unit waited in the concurrency queue.
-    queue_wait_s = round(_exec_start - started, 2)
-
-    # ---- Finalize the three terminal files + the run_completed event ----
-    writer.write_eval_result(
-        eval_status=eval_status,
-        score=score,
-        eval_duration_s=eval_duration_s,
-        error=eval_error,
-    )
-
-    cli_identity: dict[str, Any] = {}
-    if host_artifacts_dir is not None:
-        try:
-            loaded = json.loads((host_artifacts_dir / "_cli_identity.json").read_text())
-            if isinstance(loaded, dict):
-                version = loaded.get("cli_version")
-                source = loaded.get("source")
-                cli_identity = {
-                    "cli_version": version if isinstance(version, str) else None,
-                    "source": source if isinstance(source, str) and source in {"official", "fork", "custom"} else None,
-                }
-        except (OSError, ValueError):
-            pass
-    run_meta = _build_run_meta(
-        run_id=writer.run_id,
-        unit=unit,
-        config=config,
-        executor_type=executor_type,
-        status=status,
-        score=score,
-        phase=phase,
-        error_obj=error_obj,
-        error_str=error_str,
-        total_s=total_s,
-        trajectory=trajectory,
-        category=_category_from_error(error_str),
-        task_revision_value=task_revision_value,
-        environment=environment_metadata,
-        cli_identity=cli_identity,
-    )
-    writer.write_run_json(run_meta)
-
-    writer.emit_event(
-        "run_completed",
-        status=status,
-        score=score,
-        total_duration_s=total_s,
-        queue_wait_s=queue_wait_s,
-    )
-    writer.close()
+                logger.debug("ALEEnv.close_async failed or timed out: %s", e)
 
     return UnitResult(
         unit=unit,
@@ -1285,7 +1299,11 @@ def _build_run_meta(
         "status": status,
         "score": score,
         "termination": {
-            "reason": status if status != "completed" else "completed",
+            "reason": (
+                "empty_response_loop"
+                if category == "empty_response_loop"
+                else (status if status != "completed" else "completed")
+            ),
             "phase": phase,
             "category": category,
             "error": error_obj,

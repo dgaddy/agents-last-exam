@@ -16,6 +16,7 @@ import re
 from typing import Any
 
 _CATEGORY_PATTERNS: list[tuple[str, tuple[str, ...]]] = [
+    ("empty_response_loop", ("empty_response_loop",)),
     ("rate_limited", ("rate limit", "ratelimit", "429", "too many requests")),
     (
         "vm_quota_exhausted",

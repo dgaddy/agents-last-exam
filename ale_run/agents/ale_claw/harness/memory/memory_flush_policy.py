@@ -84,7 +84,9 @@ def should_run_memory_flush(
         by_tokens = threshold > 0 and current_tokens >= threshold
 
     by_transcript = (
-        force_transcript_bytes > 0 and transcript_bytes >= force_transcript_bytes
+        state.compaction_count == 0
+        and force_transcript_bytes > 0
+        and transcript_bytes >= force_transcript_bytes
     )
 
     if not (by_tokens or by_transcript):

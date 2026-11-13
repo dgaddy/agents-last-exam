@@ -280,6 +280,31 @@ async def _ensure_bridge_at(src_dir: Path, target_dir: str, *, what: str) -> str
         logger.info("ensure_%s_mcp_server: reusing dependencies at %s", what, target_dir)
         return target_dir
 
+    if _bridge_installed(str(src_dir)):
+        src_nm = src_dir / "node_modules"
+        dst_nm = Path(target_dir) / "node_modules"
+        try:
+            if dst_nm.is_symlink() or dst_nm.exists():
+                if dst_nm.is_symlink() or dst_nm.is_file():
+                    dst_nm.unlink()
+                else:
+                    shutil.rmtree(dst_nm)
+            os.symlink(str(src_nm), str(dst_nm))
+            if _bridge_installed(target_dir):
+                logger.info(
+                    "ensure_%s_mcp_server: linked prebaked node_modules %s -> %s",
+                    what,
+                    src_nm,
+                    dst_nm,
+                )
+                return target_dir
+        except OSError as e:
+            logger.warning(
+                "ensure_%s_mcp_server: symlink prebaked node_modules failed: %s",
+                what,
+                e,
+            )
+
     # 2. Install the locked production dependencies inside the bridge dir.
     npm = await ensure_npm()
     install_command = [npm, "ci" if (src_dir / "package-lock.json").is_file() else "install", "--omit=dev"]

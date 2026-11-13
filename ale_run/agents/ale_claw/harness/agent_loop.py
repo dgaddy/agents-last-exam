@@ -370,7 +370,7 @@ class OpenClawComputerAgent(ComputerAgent):
                 # explicit DONE in the assistant output ends the generator from
                 # inside; max_steps in the outer consumer is the other ceiling.
                 # === BARE-TEXT TURN NUDGE (bug-2-nudge) ===
-                self._maybe_nudge_bare_text(result, new_items)
+                self._maybe_nudge_bare_text(result, new_items, items)
 
         finally:
             loop_kwargs = {**loop_kwargs, "ale_claw_status": run_status}
@@ -446,17 +446,116 @@ class OpenClawComputerAgent(ComputerAgent):
         self,
         result: Dict[str, Any],
         new_items: List[Dict[str, Any]],
+        items: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Append a user-role continuation when a turn produced neither a tool
         call nor a DONE marker.
 
-        Without it, bare-text assistant turns leave the conversation ending on
-        an assistant turn, which some routings reject — notably
-        Anthropic-via-Vertex through OpenRouter ("This model does not support
-        assistant message prefill"). Anthropic-direct and Bedrock tolerate
-        assistant-tail, so the bug only surfaces under that specific routing.
+        Also redacts the most recent tool output or tool-attached image blocks
+        when a safety block placeholder was synthesized, and ensures
+        thought-only turns emit a synthetic assistant message before the user
+        nudge to prevent consecutive user messages.
         """
         output_items = result.get("output", [])
+        finish_reason_str = str(result.get("finish_reason") or "").lower()
+        is_safety_blocked = (
+            bool(result.get("safety_blocked"))
+            or finish_reason_str in (
+                "content_filter",
+                "safety",
+                "prohibited_content",
+                "blocklist",
+                "recitation",
+                "spii",
+            )
+            or any(
+                "[Model response blocked by safety filter" in str(item.get("content", ""))
+                for item in output_items
+                if isinstance(item, dict)
+            )
+        )
+        if is_safety_blocked:
+            redacted_img_placeholder = {
+                "type": "text",
+                "text": (
+                    "[Redacted image: The image from the previous tool output "
+                    "triggered a model safety filter and was redacted so "
+                    "execution can continue.]"
+                ),
+            }
+            redacted_tool_placeholder = (
+                "[Redacted tool output: The previous tool output triggered a "
+                "model safety filter and was redacted so execution can continue.]"
+            )
+
+            def _redact_item(prev_item: Dict[str, Any]) -> bool:
+                changed = False
+                if prev_item.get("role") == "user":
+                    content = prev_item.get("content")
+                    if isinstance(content, list):
+                        new_content = []
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") in (
+                                "image_url",
+                                "input_image",
+                                "image",
+                            ):
+                                new_content.append(dict(redacted_img_placeholder))
+                                changed = True
+                            else:
+                                new_content.append(block)
+                        if changed:
+                            prev_item["content"] = new_content
+                elif prev_item.get("type") == "computer_call_output":
+                    out_obj = prev_item.get("output")
+                    if (
+                        isinstance(out_obj, dict)
+                        and out_obj.get("type") == "input_image"
+                        and out_obj.get("image_url") not in ("", "[omitted]")
+                    ):
+                        out_obj["image_url"] = "[omitted]"
+                        changed = True
+                elif prev_item.get("type") == "function_call_output":
+                    out_str = str(prev_item.get("output", ""))
+                    if "[Redacted tool output" not in out_str and len(out_str) > 200:
+                        prev_item["output"] = redacted_tool_placeholder
+                        changed = True
+                return changed
+
+            def _is_prior_assistant_turn(prev_item: Dict[str, Any]) -> bool:
+                if prev_item.get("type") in ("function_call", "computer_call"):
+                    return True
+                if prev_item.get("role") == "assistant":
+                    return "[Model response blocked by safety filter" not in str(
+                        prev_item.get("content", "")
+                    )
+                return False
+
+            redacted_any = False
+            reached_boundary = False
+            for container in (new_items, items or []):
+                for prev_item in reversed(container):
+                    if not isinstance(prev_item, dict):
+                        continue
+                    if _is_prior_assistant_turn(prev_item):
+                        reached_boundary = True
+                        break
+                    if _redact_item(prev_item):
+                        redacted_any = True
+                if reached_boundary:
+                    break
+
+            if not redacted_any:
+                for container in (new_items, items or []):
+                    for prev_item in reversed(container):
+                        if not isinstance(prev_item, dict):
+                            continue
+                        if _redact_item(prev_item):
+                            redacted_any = True
+                            break
+                    if redacted_any:
+                        break
+
         has_tool_call = any(
             item.get("type") in ("function_call", "computer_call")
             for item in output_items
@@ -466,6 +565,31 @@ class OpenClawComputerAgent(ComputerAgent):
             or result.get("finish_reason") == "malformed_function_call"
         )
         if not has_tool_call:
+            has_assistant_msg = any(
+                item.get("type") == "message" and item.get("role") == "assistant"
+                for item in output_items
+            )
+            if not has_assistant_msg:
+                synth_text = "[Thought-only turn without tool call or text output.]"
+                new_items.append({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": synth_text}],
+                })
+                self.session_mgr.append_message("assistant", synth_text)
+            if is_safety_blocked:
+                nudge_text = (
+                    "[Safety Filter Notice] Your previous request or tool "
+                    "output/image triggered an upstream content safety filter "
+                    "and the offending content was redacted from context. Do "
+                    "NOT re-read or re-open the same image files directly; "
+                    "instead inspect metadata or pixel arrays via scripts or "
+                    "proceed with your next tool call, or output the DONE "
+                    "marker if the task is complete."
+                )
+                new_items.append({"role": "user", "content": nudge_text})
+                self.session_mgr.append_message("user", nudge_text)
+                return
             if is_malformed:
                 finish_msg = (
                     result.get("malformed_finish_message")
@@ -1068,10 +1192,18 @@ class OpenClawComputerAgent(ComputerAgent):
         # Persist compaction entry with firstKeptEntryId
         history = self.session_mgr.load_history()
         msg_entries = [e for e in history if e.type == "message"]
-        if compaction_result.first_kept_message_index < len(msg_entries):
-            first_kept_id = msg_entries[compaction_result.first_kept_message_index].id
-        else:
-            first_kept_id = msg_entries[-1].id if msg_entries else "unknown"
+        first_kept_id = None
+        if compaction_result.first_kept_message_index < len(all_messages):
+            first_kept_id = all_messages[
+                compaction_result.first_kept_message_index
+            ].get("_entry_id")
+        if not first_kept_id:
+            if compaction_result.first_kept_message_index < len(msg_entries):
+                first_kept_id = msg_entries[
+                    compaction_result.first_kept_message_index
+                ].id
+            else:
+                first_kept_id = msg_entries[-1].id if msg_entries else "unknown"
 
         self.session_mgr.append_compaction(
             compaction_result.summary,

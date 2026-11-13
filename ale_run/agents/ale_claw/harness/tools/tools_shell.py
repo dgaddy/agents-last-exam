@@ -55,9 +55,9 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _DEFAULT_MAX_OUTPUT_CHARS = 200_000
-_DEFAULT_TIMEOUT_SECONDS = 60
+_DEFAULT_TIMEOUT_SECONDS = 120
 _MIN_TIMEOUT_SECONDS = 1
-_MAX_TIMEOUT_SECONDS = 300
+_MAX_TIMEOUT_SECONDS = 600
 
 
 # ---------------------------------------------------------------------------
@@ -222,9 +222,17 @@ class ExecTool(BaseTool):
         wrapped = _wrap_with_cwd(command, cwd)
         t0 = time.monotonic()
         try:
+            try:
+                coro = self.interface.run_command(
+                    wrapped, timeout=timeout_seconds
+                )
+                wait_timeout = timeout_seconds + 15
+            except TypeError:
+                coro = self.interface.run_command(wrapped)
+                wait_timeout = timeout_seconds
             result = await asyncio.wait_for(
-                self.interface.run_command(wrapped),
-                timeout=timeout_seconds,
+                coro,
+                timeout=wait_timeout,
             )
         except asyncio.TimeoutError:
             duration_ms = int((time.monotonic() - t0) * 1000)
@@ -239,6 +247,22 @@ class ExecTool(BaseTool):
                 "duration_ms": duration_ms,
                 "cwd": cwd,
             }
+        except RuntimeError as e:
+            err_str = str(e)
+            if "timed out" in err_str.lower() or "aborted" in err_str.lower():
+                duration_ms = int((time.monotonic() - t0) * 1000)
+                return {
+                    "success": False,
+                    "status": "failed",
+                    "error": (
+                        f"Error: exec timed out after {timeout_seconds}s "
+                        f"({err_str})"
+                    ),
+                    "timed_out": True,
+                    "duration_ms": duration_ms,
+                    "cwd": cwd,
+                }
+            raise
 
         duration_ms = int((time.monotonic() - t0) * 1000)
         stdout_raw = getattr(result, "stdout", "") or ""

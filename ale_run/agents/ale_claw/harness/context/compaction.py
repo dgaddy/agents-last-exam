@@ -42,7 +42,10 @@ DEFAULT_SUMMARY_FALLBACK = "No prior history."
 MAX_SUMMARIZATION_RETRIES = 3
 """Number of retry attempts for LLM summarization calls."""
 
-SUMMARIZATION_TIMEOUT = 120
+import os as _compaction_os
+SUMMARIZATION_TIMEOUT = int(
+    float(_compaction_os.environ.get("LITELLM_REQUEST_TIMEOUT", "1800.0"))
+)
 """Timeout in seconds for each litellm.acompletion summarization call."""
 
 # ---------------------------------------------------------------------------
@@ -584,7 +587,7 @@ async def summarize_chunk(
                 resolved_summary,
                 purpose="compaction",
                 messages=llm_messages,
-                max_tokens=2048,
+                max_tokens=8192,
                 temperature=1.0,
                 timeout=timeout,
                 thinking_params=thinking_params,

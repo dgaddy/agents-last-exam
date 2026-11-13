@@ -392,6 +392,183 @@ server.tool(
 // Utility Actions
 // ================================================================
 
+function shellQuotePosix(s) {
+  return "'" + String(s).replace(/'/g, "'\\''") + "'";
+}
+
+const WIN_LAUNCH_PY = String.raw`
+import base64, ctypes, ctypes.wintypes as wt, json, os, shutil, subprocess, sys
+cfg = json.loads(base64.b64decode(sys.argv[1]).decode("utf-8"))
+exe = cfg["command"]
+args = [str(a) for a in (cfg.get("args") or [])]
+cwd = cfg.get("cwd") or None
+if not os.path.isabs(exe):
+    resolved = shutil.which(exe)
+    if resolved:
+        exe = resolved
+cmdline = subprocess.list2cmdline([exe, *args])
+
+def _launch_via_explorer_token():
+    try:
+        out = subprocess.check_output(
+            ["tasklist", "/FI", "IMAGENAME eq explorer.exe", "/FO", "CSV", "/NH"],
+            text=True, timeout=10, stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return None
+    exp_pid = None
+    for line in out.splitlines():
+        parts = [p.strip('"') for p in line.split('","')]
+        if len(parts) >= 2 and parts[0].lower() == "explorer.exe":
+            try:
+                exp_pid = int(parts[1])
+                break
+            except ValueError:
+                pass
+    if not exp_pid:
+        return None
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    adv = ctypes.WinDLL("advapi32", use_last_error=True)
+
+    class STARTUPINFOW(ctypes.Structure):
+        _fields_ = [
+            ("cb", wt.DWORD), ("lpReserved", wt.LPWSTR),
+            ("lpDesktop", wt.LPWSTR), ("lpTitle", wt.LPWSTR),
+            ("dwX", wt.DWORD), ("dwY", wt.DWORD),
+            ("dwXSize", wt.DWORD), ("dwYSize", wt.DWORD),
+            ("dwXCountChars", wt.DWORD), ("dwYCountChars", wt.DWORD),
+            ("dwFillAttribute", wt.DWORD), ("dwFlags", wt.DWORD),
+            ("wShowWindow", wt.WORD), ("cbReserved2", wt.WORD),
+            ("lpReserved2", ctypes.c_void_p),
+            ("hStdInput", wt.HANDLE), ("hStdOutput", wt.HANDLE),
+            ("hStdError", wt.HANDLE),
+        ]
+
+    class PROCESS_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("hProcess", wt.HANDLE), ("hThread", wt.HANDLE),
+            ("dwProcessId", wt.DWORD), ("dwThreadId", wt.DWORD),
+        ]
+
+    k32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+    k32.OpenProcess.restype = wt.HANDLE
+    adv.OpenProcessToken.argtypes = [wt.HANDLE, wt.DWORD, ctypes.POINTER(wt.HANDLE)]
+    adv.OpenProcessToken.restype = wt.BOOL
+    adv.DuplicateTokenEx.argtypes = [
+        wt.HANDLE, wt.DWORD, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+        ctypes.POINTER(wt.HANDLE),
+    ]
+    adv.DuplicateTokenEx.restype = wt.BOOL
+    adv.CreateProcessWithTokenW.argtypes = [
+        wt.HANDLE, wt.DWORD, wt.LPCWSTR, wt.LPWSTR, wt.DWORD,
+        ctypes.c_void_p, wt.LPCWSTR, ctypes.POINTER(STARTUPINFOW),
+        ctypes.POINTER(PROCESS_INFORMATION),
+    ]
+    adv.CreateProcessWithTokenW.restype = wt.BOOL
+
+    h_proc = k32.OpenProcess(0x1000, False, exp_pid)
+    if not h_proc:
+        return None
+    try:
+        h_tok = wt.HANDLE()
+        if not adv.OpenProcessToken(h_proc, 0x000B, ctypes.byref(h_tok)):
+            return None
+        try:
+            h_dup = wt.HANDLE()
+            if not adv.DuplicateTokenEx(h_tok, 0x02000000, None, 2, 1, ctypes.byref(h_dup)):
+                return None
+            try:
+                for logon_flag in (1, 0):
+                    si = STARTUPINFOW()
+                    si.cb = ctypes.sizeof(STARTUPINFOW)
+                    si.lpDesktop = r"winsta0\default"
+                    si.dwFlags = 1
+                    si.wShowWindow = 1
+                    pi = PROCESS_INFORMATION()
+                    cmd_buf = ctypes.create_unicode_buffer(cmdline)
+                    if adv.CreateProcessWithTokenW(
+                        h_dup, logon_flag, None, cmd_buf, 0, None, cwd,
+                        ctypes.byref(si), ctypes.byref(pi),
+                    ):
+                        k32.CloseHandle(pi.hThread)
+                        k32.CloseHandle(pi.hProcess)
+                        return int(pi.dwProcessId)
+                return None
+            finally:
+                k32.CloseHandle(h_dup)
+        finally:
+            k32.CloseHandle(h_tok)
+    finally:
+        k32.CloseHandle(h_proc)
+
+pid = _launch_via_explorer_token()
+if pid is not None:
+    print(f"PID={pid} MODE=explorer_medium_integrity")
+    sys.exit(0)
+
+flags = 0x00000200
+try:
+    p = subprocess.Popen(
+        [exe, *args], cwd=cwd, stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        creationflags=flags | 0x01000000,
+    )
+except OSError:
+    p = subprocess.Popen(
+        [exe, *args], cwd=cwd, stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        creationflags=flags,
+    )
+print(f"PID={p.pid} MODE=cua_detached")
+`.trim();
+
+server.tool(
+  "launch_app",
+  "Launch a desktop GUI application persistently in the interactive desktop session (outside the CLI command reaper / Job Object, and at standard desktop Medium Integrity on Windows). Always use launch_app instead of run_command to start GUI apps such as MuseScore, LibreOffice, Chrome, FreeCAD, or Windows .exe GUI programs.",
+  {
+    command: z.string().describe(
+      "Executable name or absolute path to launch (e.g. 'musescore3', 'libreoffice', 'google-chrome', or 'C:\\\\path\\\\to\\\\app.exe')."
+    ),
+    args: z.array(z.string()).optional().describe(
+      "Optional list of command-line arguments passed to the application."
+    ),
+    cwd: z.string().optional().describe(
+      "Optional working directory for the application."
+    ),
+  },
+  async ({ command, args, cwd }) => {
+    const argList = Array.isArray(args) ? args : [];
+    if (SERVER_PLATFORM === "win32") {
+      const payloadB64 = Buffer.from(
+        JSON.stringify({ command, args: argList, cwd: cwd || null }),
+        "utf8"
+      ).toString("base64");
+      const scriptB64 = Buffer.from(WIN_LAUNCH_PY, "utf8").toString("base64");
+      const pyExe = process.env.ALE_SANDBOX_PYTHON || "python";
+      const pyCmd = `"${pyExe}" -B -c "import base64,sys;exec(base64.b64decode('${scriptB64}'))" ${payloadB64}`;
+      const res = await client.sendCommand("run_command", { command: pyCmd }).catch(() => null);
+      if (res && (res.return_code === 0 || res.returncode === 0 || (!res.stderr && res.stdout && res.stdout.includes("PID=")))) {
+        const info = String(res.stdout || "").trim();
+        return textOnly(`Launched GUI app on desktop: ${command} (${info})`);
+      }
+      const psPayloadB64 = payloadB64;
+      const psCmd = `powershell -NoProfile -Command "$c = ConvertFrom-Json ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${psPayloadB64}'))); $p = @{ FilePath = $c.command; PassThru = $true }; if ($c.args -and $c.args.Count -gt 0) { $p['ArgumentList'] = $c.args }; if ($c.cwd) { $p['WorkingDirectory'] = $c.cwd }; $proc = Start-Process @p; Write-Output ('PID=' + $proc.Id + ' MODE=powershell')"`;
+      const psRes = await client.sendCommand("run_command", { command: psCmd });
+      const psOut = String((psRes && (psRes.stdout || psRes.stderr)) || "").trim();
+      return textOnly(`Launched GUI app on desktop: ${command}${psOut ? " (" + psOut + ")" : ""}`);
+    }
+
+    const argvQuoted = [command, ...argList].map(shellQuotePosix).join(" ");
+    const cdPrefix = cwd ? `cd ${shellQuotePosix(cwd)} && ` : "";
+    const innerBash = 'export DISPLAY="${DISPLAY:-:0}"; ' + cdPrefix + 'nohup ' + argvQuoted + ' >/dev/null 2>&1 </dev/null & echo "PID=$!"';
+    const bashCmd = `bash -lc ${shellQuotePosix(innerBash)}`;
+    const res = await client.sendCommand("run_command", { command: bashCmd });
+    const out = String((res && res.stdout) || "").trim();
+    return textOnly(`Launched GUI app on desktop: ${command}${out ? " (" + out + ")" : ""}`);
+  }
+);
+
 server.tool(
   "wait",
   "On a desktop, pause execution for a specified duration.",

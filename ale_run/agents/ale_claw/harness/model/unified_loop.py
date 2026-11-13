@@ -517,6 +517,37 @@ def _convert_response_to_output(response: Any) -> Dict[str, Any]:
     output_items: List[Dict[str, Any]] = []
 
     if not response or not hasattr(response, "choices") or not response.choices:
+        prompt_fb = (
+            getattr(response, "prompt_feedback", None)
+            or (getattr(response, "_hidden_params", {}) or {}).get("prompt_feedback")
+            or (getattr(response, "_hidden_params", {}) or {}).get("promptFeedback")
+            or (response.get("promptFeedback") if isinstance(response, dict) else None)
+        )
+        block_reason = None
+        if isinstance(prompt_fb, dict):
+            block_reason = prompt_fb.get("blockReason") or prompt_fb.get("block_reason")
+        elif prompt_fb is not None:
+            block_reason = (
+                getattr(prompt_fb, "blockReason", None)
+                or getattr(prompt_fb, "block_reason", None)
+            )
+        if block_reason:
+            placeholder = (
+                f"[Model response blocked by safety filter "
+                f"(reason={block_reason}). The most recent tool output or "
+                "image will be redacted so execution can continue. Please "
+                "use filtered commands or smaller slices.]"
+            )
+            return {
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": placeholder}],
+                }],
+                "usage": {},
+                "finish_reason": "content_filter",
+                "safety_blocked": True,
+            }
         return {"output": output_items, "usage": {}}
 
     choice = response.choices[0]
@@ -608,6 +639,30 @@ def _convert_response_to_output(response: Any) -> Dict[str, Any]:
     import builtins as _builtins
     import threading as _threading
     finish_reason = (getattr(choice, "finish_reason", None) or "").lower()
+    is_safety_finish = finish_reason in (
+        "content_filter",
+        "safety",
+        "prohibited_content",
+        "blocklist",
+        "recitation",
+        "spii",
+    )
+    if is_safety_finish and not any(
+        it.get("type") in ("message", "function_call", "computer_call")
+        for it in output_items
+        if isinstance(it, dict)
+    ):
+        placeholder = (
+            f"[Model response blocked by safety filter "
+            f"(reason={finish_reason.upper()}). The most recent tool output "
+            "or image will be redacted so execution can continue. Please use "
+            "filtered commands or smaller slices.]"
+        )
+        output_items.append({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": placeholder}],
+        })
     malformed_msg = getattr(_builtins, "_malformed_fc_cache", {}).pop(
         _threading.get_ident(), None
     )
@@ -621,6 +676,7 @@ def _convert_response_to_output(response: Any) -> Dict[str, Any]:
             "malformed_function_call" if is_malformed else finish_reason
         ),
         "malformed_tool_call": is_malformed,
+        "safety_blocked": is_safety_finish,
     }
     if malformed_msg:
         res_dict["malformed_finish_message"] = malformed_msg
@@ -631,11 +687,107 @@ def _convert_response_to_output(response: Any) -> Dict[str, Any]:
 # Unified agent loop
 # ---------------------------------------------------------------------------
 
+def _prune_oversized_images_in_messages(
+    msgs: List[Dict[str, Any]],
+    max_bytes: int | None = None,
+) -> List[Dict[str, Any]]:
+    """Prune oldest inline image blocks when total image payload exceeds max_bytes."""
+    import os as _os
+
+    if max_bytes is None:
+        try:
+            max_bytes = int(
+                _os.environ.get("ALE_MAX_IMAGE_PAYLOAD_BYTES", "24000000")
+            )
+        except ValueError:
+            max_bytes = 24_000_000
+    if max_bytes <= 0:
+        return msgs
+
+    image_locs: List[tuple[int, int, int]] = []
+    total_bytes = 0
+    for m_idx, m in enumerate(msgs):
+        if not isinstance(m, dict):
+            continue
+        content = m.get("content")
+        if not isinstance(content, list):
+            continue
+        for b_idx, block in enumerate(content):
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            raw_len = 0
+            if btype == "image_url":
+                iu = block.get("image_url")
+                url = (
+                    iu.get("url", "")
+                    if isinstance(iu, dict)
+                    else (iu if isinstance(iu, str) else "")
+                )
+                raw_len = len(url)
+            elif btype == "input_image":
+                iu = block.get("image_url", "")
+                raw_len = len(iu) if isinstance(iu, str) else 0
+            elif btype == "image":
+                src = block.get("source")
+                data = src.get("data", "") if isinstance(src, dict) else ""
+                raw_len = len(data) if isinstance(data, str) else 0
+            if raw_len > 0:
+                image_locs.append((m_idx, b_idx, raw_len))
+                total_bytes += raw_len
+
+    if total_bytes <= max_bytes:
+        return msgs
+
+    copied_msgs: Dict[int, List[Any]] = {}
+    for m_idx, b_idx, raw_len in image_locs:
+        if total_bytes <= max_bytes:
+            break
+        if m_idx not in copied_msgs:
+            msgs[m_idx] = dict(msgs[m_idx])
+            copied_msgs[m_idx] = list(msgs[m_idx]["content"])
+            msgs[m_idx]["content"] = copied_msgs[m_idx]
+        marker = (
+            "[image omitted - single image exceeded API payload limit]"
+            if raw_len > max_bytes
+            else "[image data removed - already processed by model]"
+        )
+        copied_msgs[m_idx][b_idx] = {"type": "text", "text": marker}
+        total_bytes -= raw_len
+    return msgs
+
+
 def _ensure_tool_call_pairing(msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Ensure every assistant tool_call_id has a matching tool message."""
+    reordered_msgs: List[Dict[str, Any]] = []
+    idx = 0
+    while idx < len(msgs):
+        m = msgs[idx]
+        m_role = m.get("role") if isinstance(m, dict) else getattr(m, "role", None)
+        if m_role == "assistant":
+            reordered_msgs.append(m)
+            idx += 1
+            turn_tools: List[Dict[str, Any]] = []
+            turn_others: List[Dict[str, Any]] = []
+            while idx < len(msgs):
+                nxt = msgs[idx]
+                nxt_role = nxt.get("role") if isinstance(nxt, dict) else getattr(nxt, "role", None)
+                if nxt_role == "assistant":
+                    break
+                if nxt_role in ("tool", "function"):
+                    turn_tools.append(nxt)
+                else:
+                    turn_others.append(nxt)
+                idx += 1
+            reordered_msgs.extend(turn_tools)
+            reordered_msgs.extend(turn_others)
+        else:
+            reordered_msgs.append(m)
+            idx += 1
+
     final_msgs = []
     pending_tool_call_ids = []
-    for m in msgs:
+    for m in reordered_msgs:
         is_msg_dict = isinstance(m, dict)
         role = m.get("role") if is_msg_dict else getattr(m, "role", None)
         if role == "assistant":
@@ -712,7 +864,9 @@ class UnifiedAgentConfig(AsyncAgentConfig):
         chat_tools = await _prepare_tools(tools)
 
         # Convert Responses API input → Chat Completions messages
-        chat_messages = _ensure_tool_call_pairing(_convert_input_to_messages(messages))
+        chat_messages = _prune_oversized_images_in_messages(
+            _ensure_tool_call_pairing(_convert_input_to_messages(messages))
+        )
 
         # Apply OpenClaw cache_control markers in-place. Must happen here
         # (not via a callback) because ``agent.py:_on_api_start`` passes

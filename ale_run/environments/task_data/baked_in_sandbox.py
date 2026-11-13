@@ -135,6 +135,43 @@ async def stage_input(
 async def stage_reference(
     sandbox: SandboxHandle, task_data: TaskDataSpec, *, source: str,
 ) -> dict[str, Any]:
+    """Decrypt reference.7z with retry on transient sandbox transport errors."""
+    import asyncio as _asyncio
+
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            return await _stage_reference_once(
+                sandbox, task_data, source=source
+            )
+        except (ValueError, RuntimeError) as exc:
+            msg = str(exc)
+            if (
+                isinstance(exc, ValueError)
+                or "7z decrypt" in msg
+                or "reference normalise move failed" in msg
+            ):
+                raise
+            last_exc = exc
+        except Exception as exc:
+            last_exc = exc
+        if attempt < 2:
+            backoff = 5.0 * (attempt + 1)
+            logger.warning(
+                "baked_in_sandbox: stage_reference attempt %d/3 failed (%s); "
+                "retrying in %.1fs",
+                attempt + 1,
+                last_exc,
+                backoff,
+            )
+            await _asyncio.sleep(backoff)
+    assert last_exc is not None
+    raise last_exc
+
+
+async def _stage_reference_once(
+    sandbox: SandboxHandle, task_data: TaskDataSpec, *, source: str,
+) -> dict[str, Any]:
     """Decrypt ``reference.7z`` → ``<base>/reference/`` on the sandbox.
 
     Tasks without reference data have no reference.7z; we skip cleanly.

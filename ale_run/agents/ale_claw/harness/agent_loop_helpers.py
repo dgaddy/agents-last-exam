@@ -157,26 +157,44 @@ def _strip_images_from_messages(
 
 
 def _extract_messages_for_compaction(session_mgr: SessionManager) -> list[dict[str, Any]]:
-    """Extract message entries from the transcript as dicts for compaction.
+    """Extract active message entries from the transcript as dicts for compaction.
 
-    Converts TranscriptEntry objects into the {role, content, stop_reason} format
-    expected by the compaction pipeline. Propagates stop_reason from transcript
-    entries so repair_tool_use_result_pairing() can skip synthesis for
-    error/aborted turns.
-
-    Image content blocks (base64 screenshots) are replaced with lightweight
-    text placeholders so the compaction budget matches the post-normalization
-    token count.
+    Honors prior compaction entries via firstKeptEntryId so already-compacted
+    transcript entries are not re-summarized on subsequent compactions.
     """
     history = session_mgr.load_history()
+    last_compaction_idx = -1
+    for idx, entry in enumerate(history):
+        if entry.type == "compaction":
+            last_compaction_idx = idx
+
     messages: list[dict[str, Any]] = []
-    for entry in history:
+    start_idx = 0
+    if last_compaction_idx >= 0:
+        comp_data = history[last_compaction_idx].data
+        summary_text = comp_data.get("summary", "")
+        first_kept_id = comp_data.get("firstKeptEntryId")
+        if summary_text:
+            messages.append({
+                "role": "user",
+                "content": f"[Previous compaction summary]\n{summary_text}",
+                "_entry_id": history[last_compaction_idx].id,
+            })
+        start_idx = last_compaction_idx + 1
+        if first_kept_id:
+            for idx in range(last_compaction_idx - 1, -1, -1):
+                if history[idx].id == first_kept_id:
+                    start_idx = idx
+                    break
+
+    for entry in history[start_idx:]:
         if entry.type != "message":
             continue
         msg_data = entry.data.get("message", {})
         msg: dict[str, Any] = {
             "role": msg_data.get("role", "unknown"),
             "content": msg_data.get("content", ""),
+            "_entry_id": entry.id,
         }
         stop_reason = msg_data.get("stop_reason")
         if stop_reason:

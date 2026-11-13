@@ -489,12 +489,18 @@ async def _run_gcloud(*args: str, project: str, timeout: float | None = 1800.0) 
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
     )
     if timeout is not None:
         comm_task = asyncio.create_task(proc.communicate())
         done, pending = await asyncio.wait([comm_task], timeout=timeout)
         if not done:
             logger.error("gcloud command timed out after %ss: %s", timeout, " ".join(cmd))
+            try:
+                import os, signal
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                pass
             try:
                 proc.kill()
             except Exception:

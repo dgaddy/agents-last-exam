@@ -336,13 +336,66 @@ class AleClawDeployer(BaseAgentDeployer):
         t0 = time.monotonic()
         step = 0
         task_completed = False
+        empty_loop_aborted = False
+        consecutive_empty_turns = 0
+        try:
+            max_empty_turns = int(
+                os.environ.get("ALE_MAX_CONSECUTIVE_EMPTY_TURNS", "20")
+            )
+        except ValueError:
+            max_empty_turns = 20
         transcript_path = work_dir / "openclaw_sessions" / task_id / "transcript.jsonl"
         from .harness.model.usage import start_helper_usage, stop_helper_usage
         usage_token = start_helper_usage(work_dir / "helper_usage.jsonl")
 
+        _SYNTHETIC_TURN_PREFIXES = (
+            "[Thought-only turn",
+            "[Model returned no output parts",
+            "[Model response blocked by safety filter",
+        )
+
+        def _classify_yield(output_items: list[dict[str, Any]]) -> str:
+            if any(
+                isinstance(it, dict)
+                and it.get("type") in ("function_call_output", "computer_call_output")
+                for it in output_items
+            ) or (
+                bool(output_items)
+                and all(
+                    isinstance(it, dict) and it.get("role") == "user"
+                    for it in output_items
+                )
+            ):
+                return "tool_output"
+            if any(
+                isinstance(it, dict)
+                and it.get("type") in ("function_call", "computer_call")
+                for it in output_items
+            ):
+                return "active_llm"
+            for it in output_items:
+                if not isinstance(it, dict) or it.get("type") != "message":
+                    continue
+                if it.get("role", "assistant") != "assistant":
+                    continue
+                content = it.get("content", "")
+                if isinstance(content, str):
+                    txt = content.strip()
+                elif isinstance(content, list):
+                    txt = "\n".join(
+                        str(b.get("text", ""))
+                        for b in content
+                        if isinstance(b, dict) and b.get("text")
+                    ).strip()
+                else:
+                    txt = ""
+                if txt and not txt.startswith(_SYNTHETIC_TURN_PREFIXES):
+                    return "active_llm"
+            return "empty_llm"
+
         try:
             async def _drive() -> None:
-                nonlocal step, task_completed
+                nonlocal step, task_completed, empty_loop_aborted, consecutive_empty_turns
                 # cfg.base_url / cfg.api_key (custom OpenAI-compatible gateway,
                 # e.g. Meta) thread straight through OpenClawComputerAgent.run →
                 # litellm as api_base/api_key kwargs — no os.environ mutation.
@@ -353,7 +406,25 @@ class AleClawDeployer(BaseAgentDeployer):
                 ):
                     sys.stdout.flush()
                     step += 1
-                    if has_done_signal(result.get("output", [])):
+                    output_items = result.get("output", [])
+                    turn_kind = _classify_yield(output_items)
+                    if turn_kind == "active_llm":
+                        consecutive_empty_turns = 0
+                    elif turn_kind == "empty_llm":
+                        consecutive_empty_turns += 1
+                        if (
+                            max_empty_turns > 0
+                            and consecutive_empty_turns >= max_empty_turns
+                        ):
+                            logger.warning(
+                                "ale-claw: empty_response_loop after %d "
+                                "consecutive empty turns at step %d",
+                                consecutive_empty_turns,
+                                step,
+                            )
+                            empty_loop_aborted = True
+                            break
+                    if has_done_signal(output_items):
                         logger.info("ale-claw: done signal at step %d", step)
                         task_completed = True
             await _drive()
@@ -374,9 +445,15 @@ class AleClawDeployer(BaseAgentDeployer):
         if task_completed:
             status = "completed"
             error: str | None = None
-        elif max_steps is not None and step >= max_steps:
+        elif empty_loop_aborted:
             status = "failed"
-            error = f"max_turns {max_steps} reached before DONE"
+            error = (
+                f"empty_response_loop: aborted after "
+                f"{consecutive_empty_turns} consecutive empty turns"
+            )
+        elif max_steps is not None and step >= max_steps:
+            status = "completed"     # finished at step budget — not a wall-clock failure
+            error = None
         else:
             status = "failed"
             error = "loop exited without done signal"

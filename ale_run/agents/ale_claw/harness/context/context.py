@@ -242,6 +242,11 @@ _CONTEXT_OVERFLOW_PATTERNS = [
     "context overflow",
     "too many tokens",
     "content_too_large",
+    "payload too large",
+    "request entity too large",
+    "exceeds maximum allowed limit",
+    "status code: 413",
+    "http 413",
 ]
 
 _RATE_LIMIT_EXCLUDE = re.compile(r"rate.?limit|tpm|tpd|rpm|rpd", re.IGNORECASE)

@@ -111,7 +111,7 @@ async def run_memory_flush(
             purpose="memory_flush",
             messages=messages,
             tools=[memory_write_tool],
-            max_tokens=4096,
+            max_tokens=8192,
             temperature=1.0,
             thinking_params=thinking_params,
             api_key=api_key,

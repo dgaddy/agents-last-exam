@@ -22,6 +22,7 @@ duration into a task-level metrics summary.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
@@ -42,12 +43,56 @@ from ale_run.base_interface import (
     AgentRunResult,
     BaseAgentDeployer,
     ContentPart,
+    ImageSource,
     Observation,
     StepMetrics,
     ToolCall,
     ToolResult,
     TrajectoryBuilder,
 )
+
+_EAGER_CUA_TOOL_NAMES: tuple[str, ...] = (
+    "screenshot",
+    "launch_app",
+    "click",
+    "mouse_move",
+    "mouse_down",
+    "mouse_up",
+    "drag",
+    "scroll",
+    "key",
+    "key_down",
+    "key_up",
+    "hold_key",
+    "type",
+    "wait",
+    "cursor_position",
+    "get_screen_size",
+)
+
+_ALE_AGY_GLOBAL_RULES = """# Sandbox Environment & Execution Guidelines
+
+1. **Offline Sandbox Environment**:
+   - This VM has no outbound public internet access (`pip install`, `npm install`, `apt-get`, `curl`/`wget` to external domains will fail or time out).
+   - Rely on pre-installed system packages, local Python/Node environments, local wheels/archives, and files already present on disk.
+
+2. **Desktop GUI Interaction & Persistent GUI Applications (`mcp_cua_*`)**:
+   - All desktop GUI tools (`mcp_cua_screenshot`, `mcp_cua_launch_app`, `mcp_cua_click`, `mcp_cua_type`, `mcp_cua_key`, `mcp_cua_scroll`, `mcp_cua_drag`, etc.) are pre-loaded and directly callable.
+   - `mcp_cua_screenshot` attaches the captured screenshot **inline** in the tool result — inspect the attached image directly without calling `read_file` on the saved copy.
+   - **CRITICAL**: Always use `mcp_cua_launch_app` (never `run_command`) to launch desktop GUI applications (such as MuseScore, LibreOffice, Chrome, FreeCAD, or Windows `.exe` GUI programs):
+     - Processes spawned via `run_command` are terminated when the CLI session exits and run with non-desktop/elevated tokens on Windows (which disables Windows UAC Registry/File `VirtualStore` virtualization).
+     - `mcp_cua_launch_app` launches apps in the interactive desktop user session and keeps them running after exit when a task requires an application to remain open.
+
+3. **Command Execution & Anti-Polling (`run_command`)**:
+   - `WaitMsBeforeAsync` supports up to `300000` ms (5 minutes). For compilations, simulations, numerical solvers, rendering, or test scripts expected to finish within a few minutes, set `WaitMsBeforeAsync` to `60000`–`300000` so they complete synchronously in one turn.
+   - If a long command backgrounds as a task, set `NotificationTimeoutSeconds` (e.g., `60`–`180`) and wait for the completion notification; do not poll `manage_task` repeatedly or run `sleep` loops.
+
+4. **Pre-Completion Verification**:
+   - Before finishing, verify every required output file at its exact requested path:
+     - Confirm files exist, are non-empty, and parse cleanly without syntax, schema, or formula errors (`#REF!`, `#DIV/0!`, `#VALUE!`, `#NAME?`, `NaN`).
+     - Double-check units, rounding, column headers, row counts, and edge cases against the prompt requirements.
+     - For visual, document, presentation, spreadsheet, CAD, web, or GUI deliverables, inspect rendered pages or take a fresh `mcp_cua_screenshot` to verify visual fidelity, ensure changes are saved to disk, and leave any required GUI application open if requested.
+"""
 
 from .config import AntigravityCliConfig
 from .metrics import build_metrics_summary
@@ -403,13 +448,21 @@ class AntigravityCliDeployer(BaseAgentDeployer):
         gemini_home = Path(home) / ".gemini"
         gemini_home.mkdir(parents=True, exist_ok=True)
         self._gemini_dir = str(gemini_home)
+        (gemini_home / "AGENTS.md").write_text(
+            _ALE_AGY_GLOBAL_RULES,
+            encoding="utf-8",
+        )
+        cua_env = dict(cua_bridge_env(self.executor))
+        if getattr(sandbox, "python", ""):
+            cua_env["ALE_SANDBOX_PYTHON"] = sandbox.python
         cua_server = {
             "cua": {
                 "command": sandbox.node,
                 "args": [
                     self._join(sandbox.mcp_server_dir, "src", "index.js", is_linux=sandbox.is_linux)
                 ],
-                "env": cua_bridge_env(self.executor),
+                "env": cua_env,
+                "tools": {name: {"eager": True} for name in _EAGER_CUA_TOOL_NAMES},
             },
         }
         # agy >= 1.1 reads CLI policy from its own app-data directory. Keep the
@@ -795,6 +848,10 @@ class AntigravityCliDeployer(BaseAgentDeployer):
                         attempt_log.unlink(missing_ok=True)
                     except OSError:
                         pass
+                try:
+                    self._stage_step_screenshots(gemini_dir, transcript_file, wd)
+                except Exception as shot_exc:  # noqa: BLE001
+                    logger.warning("antigravity_cli: failed to stage step screenshots: %s", shot_exc)
 
             exit_code = proc.returncode
             native_result = _read_result_envelope(transcript_file, offset=tx_offset)
@@ -863,8 +920,55 @@ class AntigravityCliDeployer(BaseAgentDeployer):
         return env
 
     @staticmethod
+    def _stage_step_screenshots(
+        gemini_dir: str,
+        transcript_file: Path,
+        work_dir: Path,
+    ) -> None:
+        """Copy agy step media files into work_dir/agy_screenshots for gather_dir."""
+        if not gemini_dir:
+            return
+        gdir = Path(gemini_dir)
+        if not gdir.is_dir():
+            return
+        conv_id = _read_conversation_id(transcript_file) if transcript_file.is_file() else None
+        search_roots: list[Path] = []
+        if conv_id:
+            for sub in ("antigravity-cli", "antigravity"):
+                cand = gdir / sub / "brain" / conv_id / ".system_generated" / "steps"
+                if cand.is_dir():
+                    search_roots.append(cand)
+        if not search_roots:
+            search_roots = [p for p in gdir.rglob("steps") if p.is_dir() and ".system_generated" in p.parts]
+        if not search_roots:
+            return
+
+        out_dir = work_dir / "agy_screenshots"
+        allowed_exts = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+        copied = 0
+        for steps_root in search_roots:
+            for step_dir in sorted(steps_root.iterdir()):
+                if not step_dir.is_dir() or not step_dir.name.isdigit():
+                    continue
+                step_idx = int(step_dir.name)
+                for media_file in sorted(step_dir.glob("media_0.*")):
+                    ext = media_file.suffix.lower()
+                    if ext not in allowed_exts or not media_file.is_file():
+                        continue
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    dst = out_dir / f"agy_step_{step_idx}{ext}"
+                    shutil.copyfile(media_file, dst)
+                    copied += 1
+                    break
+        if copied:
+            logger.info("antigravity_cli: staged %d step screenshot(s) into %s", copied, out_dir)
+
+    @staticmethod
     def _apply_gemini_provider_env(cfg: AntigravityCliConfig, env: dict[str, str]) -> None:
         """Populate Gemini API / sidecar proxy routing env vars."""
+        env.setdefault("AGY_CLI_MCP_MAX_OUTPUT_BYTES", "10485760")
+        env.setdefault("AGY_CLI_MAX_WAIT_MS", "300000")
+        env.setdefault("AGY_CLI_DISABLE_SEARCH_WEB", "1")
         env["GEMINI_API_KEY"] = (
             cfg.api_key
             or env.get("GEMINI_API_KEY")
@@ -975,7 +1079,10 @@ class AntigravityCliDeployer(BaseAgentDeployer):
             "transcript_path": str(transcript_file),
         }
         before_stream_steps = len(builder.trajectory.steps)
-        added_generation = cls._consume_stream_steps(native_events, builder)
+        added_generation = cls._consume_stream_steps(native_events, builder, work_dir=work_dir)
+        shots_dir = work_dir / "agy_screenshots"
+        if shots_dir.is_dir():
+            shutil.rmtree(shots_dir, ignore_errors=True)
         stream_steps_added = len(builder.trajectory.steps) > before_stream_steps
         if envelope is not None and (
             "response" in envelope or "status" in envelope or "usage" in envelope
@@ -1063,6 +1170,8 @@ class AntigravityCliDeployer(BaseAgentDeployer):
         cls,
         native_events: list[dict],
         builder: TrajectoryBuilder,
+        *,
+        work_dir: Path | None = None,
     ) -> bool:
         """Map agy's step stream to ordered ATIF generation/tool steps.
 
@@ -1101,7 +1210,9 @@ class AntigravityCliDeployer(BaseAgentDeployer):
             if terminal is None:
                 latest = records[-1]
                 if latest.get("step_type") == "tool":
-                    cls._consume_tool_step(latest, step_index, builder, include_result=False)
+                    cls._consume_tool_step(
+                        latest, step_index, builder, include_result=False, work_dir=work_dir
+                    )
                 elif latest.get("step_type") == "agent_response":
                     chunks = [
                         record["text_delta"]
@@ -1147,7 +1258,7 @@ class AntigravityCliDeployer(BaseAgentDeployer):
                 )
                 added_generation = True
             elif step_type == "tool":
-                cls._consume_tool_step(terminal, step_index, builder)
+                cls._consume_tool_step(terminal, step_index, builder, work_dir=work_dir)
             elif step_type not in {"", "user_input"}:
                 builder.add_step(
                     source="system",
@@ -1167,6 +1278,7 @@ class AntigravityCliDeployer(BaseAgentDeployer):
         builder: TrajectoryBuilder,
         *,
         include_result: bool = True,
+        work_dir: Path | None = None,
     ) -> None:
         tool_info = update.get("tool_info")
         if not isinstance(tool_info, dict):
@@ -1197,6 +1309,34 @@ class AntigravityCliDeployer(BaseAgentDeployer):
             content.append(ContentPart(type="text", text=_json_text(output)))
         if error is not None:
             content.append(ContentPart(type="text", text=_json_text(error)))
+        if work_dir is not None:
+            shots_dir = work_dir / "agy_screenshots"
+            if shots_dir.is_dir():
+                for ext, media_type in (
+                    (".png", "image/png"),
+                    (".jpg", "image/jpeg"),
+                    (".jpeg", "image/jpeg"),
+                    (".webp", "image/webp"),
+                    (".gif", "image/gif"),
+                ):
+                    shot_file = shots_dir / f"agy_step_{step_index}{ext}"
+                    if shot_file.is_file():
+                        try:
+                            b64_data = base64.b64encode(shot_file.read_bytes()).decode("ascii")
+                            content.append(
+                                ContentPart(
+                                    type="image",
+                                    image=ImageSource(
+                                        type="base64",
+                                        media_type=media_type,
+                                        data=b64_data,
+                                    ),
+                                )
+                            )
+                            shot_file.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                        break
         builder.add_step(
             source="environment",
             observation=Observation(

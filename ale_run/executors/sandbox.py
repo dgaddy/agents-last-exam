@@ -166,6 +166,11 @@ class SandboxExecutor(BaseExecutor):
             pending_error = sys.exception()
             try:
                 await self.stop_deployer()
+                if deployer_cls.__name__ == "AntigravityCliDeployer":
+                    try:
+                        await self._stage_guest_agy_screenshots()
+                    except Exception as shot_exc:                       # noqa: BLE001
+                        logger.warning("stage_guest_agy_screenshots failed: %s", shot_exc)
             except BaseException as stop_exc:
                 if self.last_run_result is not None:
                     stop_exc.add_note(
@@ -586,6 +591,72 @@ class SandboxExecutor(BaseExecutor):
             parent = remote_path.rsplit(sep, 1)[0]
             await sandbox.mkdir(parent)
             await sandbox.write_file(remote_path, data)
+
+    async def _stage_guest_agy_screenshots(self) -> None:
+        """Best-effort host-side fallback to stage agy step media after stop_deployer."""
+        import base64 as _b64
+        import subprocess as _sp
+
+        sb = self.sandbox
+        collect_py = f"""import json, os, pathlib, shutil
+wd = pathlib.Path({self.work_dir!r})
+gdir = pathlib.Path(os.path.expanduser("~")) / ".gemini"
+if not gdir.is_dir() or not wd.is_dir():
+    raise SystemExit(0)
+conv_id = None
+tx = wd / "transcript.jsonl"
+if tx.is_file():
+    for line in reversed(tx.read_text(encoding="utf-8", errors="replace").splitlines()):
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(rec, dict):
+            for cand in (
+                rec.get("conversation_id"),
+                (rec.get("result") if isinstance(rec.get("result"), dict) else {{}}).get("conversation_id"),
+                (rec.get("step_update") if isinstance(rec.get("step_update"), dict) else {{}}).get("conversation_id"),
+                (rec.get("init") if isinstance(rec.get("init"), dict) else {{}}).get("conversation_id"),
+            ):
+                if isinstance(cand, str) and cand.strip():
+                    conv_id = cand.strip()
+                    break
+            if conv_id:
+                break
+roots = []
+if conv_id:
+    for sub in ("antigravity-cli", "antigravity"):
+        c = gdir / sub / "brain" / conv_id / ".system_generated" / "steps"
+        if c.is_dir():
+            roots.append(c)
+if not roots:
+    roots = [p for p in gdir.rglob("steps") if p.is_dir() and ".system_generated" in p.parts]
+out_dir = wd / "agy_screenshots"
+allowed = {{".png", ".jpg", ".jpeg", ".webp", ".gif"}}
+for sr in roots:
+    for sd in sorted(sr.iterdir()):
+        if not sd.is_dir() or not sd.name.isdigit():
+            continue
+        idx = int(sd.name)
+        for mf in sorted(sd.glob("media_0.*")):
+            ext = mf.suffix.lower()
+            if ext in allowed and mf.is_file():
+                out_dir.mkdir(parents=True, exist_ok=True)
+                dst = out_dir / f"agy_step_{{idx}}{{ext}}"
+                if not dst.is_file():
+                    shutil.copyfile(mf, dst)
+                break
+"""
+        b64 = _b64.b64encode(collect_py.encode("utf-8")).decode("ascii")
+        cmd = (
+            f"{shlex.quote(sb.python)} -B -c "
+            f"{shlex.quote(f'import base64;exec(base64.b64decode({b64!r}))')}"
+            if sb.is_linux
+            else _sp.list2cmdline(
+                [sb.python, "-B", "-c", f"import base64;exec(base64.b64decode('{b64}'))"]
+            )
+        )
+        await sb.run_command(cmd, timeout=30)
 
     async def _read_pid(self, pid_file: str) -> int | None:
         """Poll for the launcher's pid file. Returns None on timeout."""

@@ -45,6 +45,11 @@ _CONTEXT_OVERFLOW_PATTERNS: tuple[str, ...] = (
     "exceeds the maximum number of tokens",
     "context window",
     "too many tokens",
+    "payload too large",
+    "request entity too large",
+    "exceeds maximum allowed limit",
+    "status code: 413",
+    "http 413",
 )
 
 # Substrings in exception messages or types that indicate a transient
@@ -469,6 +474,14 @@ def _default_transcript_api_label(provider: str, model_api: str) -> str:
 
 
 def _lookup_context_window(model: str) -> int | None:
+    env_override = os.environ.get("CONTEXT_WINDOW_OVERRIDE")
+    if env_override:
+        try:
+            val = int(env_override)
+            if val > 0:
+                return val
+        except ValueError:
+            pass
     for candidate in _model_candidates(model):
         try:
             import litellm
@@ -479,6 +492,8 @@ def _lookup_context_window(model: str) -> int | None:
                 return int(max_input)
         except Exception:
             continue
+    if "gemini" in (model or "").lower():
+        return 1_000_000
     return None
 
 

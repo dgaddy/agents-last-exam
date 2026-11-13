@@ -694,7 +694,10 @@ class WebFetchTool(BaseTool):
         body_bytes = bytearray()
         truncated_body = False
         async with aiohttp.ClientSession(
-            timeout=timeout, connector=connector
+            timeout=timeout,
+            connector=connector,
+            max_line_size=65536,
+            max_field_size=65536,
         ) as session:
             async with session.get(
                 url,
