@@ -48,6 +48,25 @@ JUDGE_TIMEOUT_SECONDS = 180
 NUMBER_RE = re.compile(r"[+-]?(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?")
 
 
+def _number_in_evidence(
+    number: str,
+    evidence: str,
+    *,
+    name: str,
+    item: dict[str, Any],
+) -> bool:
+    direction = item.get("direction") if name == "primary_lift" else None
+    if number.startswith("-"):
+        sign_and_body = rf"[-\u2212]{re.escape(number[1:])}"
+    elif not number.startswith("+") and direction == "increase":
+        sign_and_body = rf"\+?{re.escape(number)}"
+    elif not number.startswith("+") and direction == "decrease":
+        sign_and_body = rf"[-\u2212]?{re.escape(number)}"
+    else:
+        sign_and_body = re.escape(number)
+    return bool(re.search(rf"(?<![\w.,\u2212+-]){sign_and_body}(?![\w,]|\.\d)", evidence))
+
+
 def check_claims(
     report: str,
     claims: dict[str, Any],
@@ -94,7 +113,7 @@ def check_claims(
             if (
                 not isinstance(number, str)
                 or not NUMBER_RE.fullmatch(number)
-                or not re.search(rf"(?<![\w.,+-]){re.escape(number)}(?![\w,]|\.\d)", evidence)
+                or not _number_in_evidence(number, evidence, name=name, item=item)
             ):
                 raise ValueError("Judge number lacks exact report evidence")
             if not math.isfinite(float(number.replace(",", ""))):
