@@ -18,8 +18,17 @@ Install the
 gcloud auth login
 git clone git@github.com:rdi-berkeley/agents-last-exam.git
 cd agents-last-exam
-uv sync --all-packages
+bash env/install_host_deps.sh
+uv sync --all-packages --locked
+bash env/verify_host_env.sh
 ```
+
+The host installer supports Ubuntu 22.04/24.04/26.04 and Debian 12/13; see
+[host evaluation dependencies](../env/README.md#host-evaluation-environment).
+The checked-in `uv.lock` pins Python dependencies. Verification checks native
+tools, deferred evaluator imports, and all 122 active task entry points without
+starting VMs or contacting judges. The runner repeats host checks before its
+Judge preflight; `--dry-run` remains a configuration-only preview.
 
 The host's `gcloud` login creates and deletes VMs. A separate service-account
 key is injected into each sandbox for Cloud Storage.
@@ -166,8 +175,9 @@ video judges retain their Gemini configuration. The hello-world task needs no ju
 Before starting sandboxes, a batch containing shared LLM-judge tasks checks the
 configured judge with a text request and, when needed, an image request. A failed
 check aborts the batch. Fix the judge configuration and rerun the same command.
-`--dry-run` does not contact the judge. A later judge outage is an evaluation
-failure requiring retry, not a valid score.
+`--dry-run` does not contact the judge. A later judge outage or malformed scoring
+reply produces an evaluation error with `score: null`, never zero or a substitute
+score. Odoo uses database checks and does not require a Judge API.
 
 ## 8. Validate and run the demo
 
@@ -206,10 +216,16 @@ cleanup_mode: keep
 Choose concurrency according to project quota, GPU availability, LLM rate
 limits, and budget, including retained sandboxes. Auto-resume skips prior
 `completed` and `timeout` units only when `run.json`'s `task.revision` matches
-the current task-folder SHA256. Missing or changed hashes rerun; see the
-[v1 log upgrade helper](releases/v1.1.md#upgrade-existing-logs) for legacy logs.
+the current task-folder SHA256 and `eval_result.json` confirms a successful,
+error-free evaluation with the same numeric score. Unscored evaluation timeouts
+are not complete. Missing or changed hashes rerun; see the
+[v1 log reuse guidance](releases/v1.1.md#upgrade-existing-logs) for legacy logs.
 Failed units retry up to `max_attempts`. Use `--disable-resume` to run every
 selected unit once without retries.
+
+`run.json` includes the expanded, redacted agent config and, when available,
+`agent.cli_identity` with the probed CLI version and selected source. Unknown
+values are `null`. Resume checks the task revision, not CLI identity.
 
 ## Cleanup and recovery
 

@@ -31,14 +31,14 @@ The harness passes:
 - `--always-approve` so tool calls do not wait for an interactive user
 - `--no-auto-update` so a benchmark run cannot change its own CLI version
 - `--sandbox off` because the ALE VM is already the isolation boundary
-- `--no-plan` because ALE episodes have no interactive plan-approval client
 - `--output-format streaming-json` for incremental output and final usage
 
 These are harness invariants, not experiment knobs. Grok's built-in web tools
 remain enabled: `web_search` searches the internet and `web_fetch` retrieves a
 URL. They are separate from `search_tool`, which searches the schemas exposed by
 connected MCP servers (for example, discovering the `cua__*` tools). An
-experiment can remove any additional built-in tool through `disabled_tools`.
+experiment can remove a built-in tool through `disabled_tools`, which is empty
+by default.
 
 `transcript.jsonl` contains `thought`, `text`, `end`, and `error` events. Grok
 Build does not emit tool calls on stdout. The harness therefore parses the
@@ -54,7 +54,11 @@ spooled across range chunks without exposing or truncating partial records.
 The final `end` event is the authoritative accounting source. Its
 `input_tokens` field is uncached input, while `cache_read_input_tokens` is
 recorded separately. Reported cost is persisted only when Grok Build supplies
-the complete `total_cost_usd` field.
+the complete `total_cost_usd` field. If run-local OpenTelemetry records more
+API calls than the terminal snapshot, the parser uses those per-call token
+counts and omits the incomplete terminal cost; the raw snapshot remains in
+the transcript. The final total cost is `null` when a complete cost is not
+available; it is not an estimate of zero.
 
 ## Telemetry
 
@@ -96,16 +100,16 @@ invokes them through Grok's `search_tool` and `use_tool` wrappers.
 The trajectory parser unwraps `use_tool` so ALE records the underlying CUA tool
 name and arguments.
 
-These are harness invariants rather than user-facing options. Grok Build's plan
-approval is an interactive client flow, so `exit_plan_mode` cannot complete in
-a headless episode even when `--always-approve` is set. The harness always
-removes `ask_user_question`, `enter_plan_mode`, and `exit_plan_mode`.
-`disabled_tools` only adds further exclusions.
+Grok Build's plan approval is an interactive client flow, so `exit_plan_mode`
+may not complete in a headless episode even when `--always-approve` is set.
+No tools are removed unless `disabled_tools` is explicitly configured.
 
 MCP image results are stored as data URLs in Grok's chat history or its
 run-local MCP spill files. The parser converts them to
 `ImageSource(type="base64")`; the framework then writes them under the standard
 `screenshots/` directory before serializing the trajectory.
+Images extracted into a subsequent user message are attached to the preceding
+tool result as well.
 
 ## Custom Models
 
@@ -130,6 +134,9 @@ root that exposes the selected wire protocol: `<base_url>/chat/completions`,
 `<base_url>/responses`, or `<base_url>/messages`. Custom gateways must emit that
 protocol exactly. For example, a Responses gateway that adds unknown SSE event
 types can be rejected by Grok Build's strict event decoder.
+
+For the tested OpenRouter configuration, see
+`configs/agents/grok_build_openrouter.yaml` and set `OPENROUTER_API_KEY`.
 
 `reasoning_effort` is passed as `--reasoning-effort`. Grok Build accepts the
 canonical levels `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`

@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import sys
 from pathlib import Path
 
@@ -76,9 +77,10 @@ def main(argv: list[str] | None = None) -> int:
 
 async def _cmd_run(args: argparse.Namespace) -> int:
     spec = load_experiment(args.spec_path)
-    if args.cpu_machine_family and "gcloud" in spec.environment.provider_specs:
+    cpu_machine_family = getattr(args, "cpu_machine_family", None)
+    if cpu_machine_family and "gcloud" in spec.environment.provider_specs:
         spec.environment.provider_specs["gcloud"].config["cpu_machine_family"] = (
-            args.cpu_machine_family
+            cpu_machine_family
         )
     runner = Runner(spec)
     units = _filter_units(runner.enumerate_units(), args)
@@ -157,7 +159,7 @@ def _unit_already_done(
     *,
     revisions: dict[str, str] | None = None,
 ) -> bool:
-    """Skip only completed/timeout runs whose task-folder revision still matches."""
+    """Skip scored completed/timeout runs whose task-folder revision still matches."""
     model = (unit.agent_spec.config or {}).get("model", "")
     v_dir = (
         output_root
@@ -181,13 +183,22 @@ def _unit_already_done(
             continue
         try:
             record = json.loads(run_json.read_text(encoding="utf-8"))
+            evaluation = json.loads((ts_dir / "eval_result.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
         if not isinstance(record, dict) or not isinstance(record.get("task"), dict):
             continue
+        score = record.get("score")
         if (
             record.get("status") in _RESUME_DONE_STATUSES
             and record["task"].get("revision") == revisions[unit.task_path]
+            and isinstance(score, (int, float)) and not isinstance(score, bool)
+            and math.isfinite(score) and 0 <= score <= 1
+            and isinstance(evaluation, dict)
+            and evaluation.get("eval_status") == "success"
+            and not evaluation.get("error")
+            and not isinstance(evaluation.get("score"), bool)
+            and evaluation.get("score") == score
         ):
             return True
     return False

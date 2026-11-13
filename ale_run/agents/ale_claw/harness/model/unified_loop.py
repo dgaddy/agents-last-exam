@@ -26,11 +26,12 @@ from PIL import Image
 
 from agent.decorators import register_agent
 from agent.loops.base import AsyncAgentConfig
-from agent.types import AgentCapability, Messages, Tools
+from agent.types import AgentCapability, Messages
 
 from ._message_shapes import _image_url_block
 from .cache_policy import apply_openclaw_cache_markers
-from .model_config import call_with_retry_budget
+from .model_config import call_with_retry_budget, model_generation_kwargs
+from .reasoning import reasoning_fields
 
 
 # Fallback call_id when a tool/computer call item arrives without an id/call_id.
@@ -51,7 +52,8 @@ async def _build_computer_tool_schema(computer_handler: Any) -> Dict[str, Any]:
     action schema.  This is the same schema upstream uses for GPT-5.4.
     """
     try:
-        width, height = await computer_handler.get_dimensions()
+        get_dimensions = getattr(computer_handler, "get_model_dimensions", computer_handler.get_dimensions)
+        width, height = await get_dimensions()
     except Exception:
         width, height = DEFAULT_DISPLAY_WIDTH, DEFAULT_DISPLAY_HEIGHT
 
@@ -102,7 +104,7 @@ async def _build_computer_tool_schema(computer_handler: Any) -> Dict[str, Any]:
                         "type": "string",
                     },
                     "keys": {
-                        "description": "Keys to press (for action=keypress). Example: ['ctrl', 'c']",
+                        "description": "Keys to press. Modifiers form a chord (e.g. ['ctrl', 'c']); other keys are pressed in sequence.",
                         "type": "array",
                         "items": {"type": "string"},
                     },
@@ -112,6 +114,10 @@ async def _build_computer_tool_schema(computer_handler: Any) -> Dict[str, Any]:
                     },
                     "scroll_y": {
                         "description": "Vertical scroll amount. Positive=down, negative=up.",
+                        "type": "integer",
+                    },
+                    "ms": {
+                        "description": "Duration in milliseconds for wait.",
                         "type": "integer",
                     },
                     "button": {
@@ -266,8 +272,21 @@ def _append_assistant_role(
     """Convert a ``role: assistant`` item into a Chat Completions assistant
     message, lifting tool_use blocks into ``tool_calls``."""
     content = item.get("content", [])
+    fields = reasoning_fields(item)
+    pending = (
+        messages[-1]
+        if messages and messages[-1].get("role") == "assistant"
+        and messages[-1].get("content") is None
+        and not messages[-1].get("tool_calls")
+        and ("reasoning_content" in messages[-1] or "reasoning_details" in messages[-1])
+        else None
+    )
     if isinstance(content, str):
-        messages.append({"role": "assistant", "content": content})
+        if pending is not None:
+            pending["content"] = content
+            pending.update(fields)
+        else:
+            messages.append({"role": "assistant", "content": content, **fields})
     elif isinstance(content, list):
         text_parts = []
         tool_calls = []
@@ -296,8 +315,12 @@ def _append_assistant_role(
                 tool_calls.append(tc_entry)
                 call_id_to_fn_name[c.get("id", FALLBACK_CALL_ID)] = c.get("name", "")
             elif ctype == "thinking":
-                # Thinking block — skip (not needed for replay)
-                pass
+                if "reasoning_content" in c:
+                    fields["reasoning_content"] = c["reasoning_content"]
+                elif c.get("thinking"):
+                    fields["reasoning_content"] = c["thinking"]
+                if "reasoning_details" in c:
+                    fields["reasoning_details"] = c["reasoning_details"]
         msg: Dict[str, Any] = {"role": "assistant"}
         msg["content"] = "\n".join(text_parts) if text_parts else None
         thinking_parts = [
@@ -309,13 +332,9 @@ def _append_assistant_role(
             msg["reasoning_content"] = "\n".join(p for p in thinking_parts if p)
         if tool_calls:
             msg["tool_calls"] = tool_calls
-        if (
-            messages
-            and messages[-1].get("role") == "assistant"
-            and messages[-1].get("content") is None
-            and not messages[-1].get("tool_calls")
-        ):
-            messages[-1].update(msg)
+        msg.update(fields)
+        if pending is not None:
+            pending.update(msg)
         else:
             messages.append(msg)
     else:
@@ -323,7 +342,7 @@ def _append_assistant_role(
 
 
 def _append_reasoning(item: Dict[str, Any], messages: List[Dict[str, Any]]) -> None:
-    """Convert a prior-turn ``reasoning`` item into an assistant reasoning_content field."""
+    """Start an assistant turn carrying its structured reasoning."""
     summary = item.get("summary", [])
     text = ""
     if isinstance(summary, list):
@@ -333,10 +352,11 @@ def _append_reasoning(item: Dict[str, Any], messages: List[Dict[str, Any]]) -> N
                 break
     if not text:
         text = item.get("reasoning", "")
-    if text:
-        messages.append(
-            {"role": "assistant", "content": None, "reasoning_content": text}
-        )
+    fields = reasoning_fields(item)
+    if "reasoning_content" not in fields and text:
+        fields["reasoning_content"] = text
+    if fields:
+        messages.append({"role": "assistant", "content": None, **fields})
 
 
 def _append_function_call(
@@ -465,7 +485,23 @@ def _convert_input_to_messages(items: Messages) -> List[Dict[str, Any]]:
         elif item_type == "computer_call_output":
             _append_computer_call_output(item, messages)
 
-    return messages
+    ordered: List[Dict[str, Any]] = []
+    pending: set[str] = set()
+    deferred: List[Dict[str, Any]] = []
+    for message in messages:
+        if message.get("role") == "assistant" and message.get("tool_calls"):
+            pending.update(call["id"] for call in message["tool_calls"])
+        if pending and message.get("role") == "user":
+            deferred.append(message)
+            continue
+        ordered.append(message)
+        if message.get("role") == "tool":
+            pending.discard(message.get("tool_call_id"))
+            if not pending:
+                ordered.extend(deferred)
+                deferred = []
+    ordered.extend(deferred)
+    return ordered
 
 
 # ---------------------------------------------------------------------------
@@ -486,23 +522,17 @@ def _convert_response_to_output(response: Any) -> Dict[str, Any]:
     choice = response.choices[0]
     message = choice.message
 
-    # --- Extract reasoning (OpenRouter returns in reasoning_content) ---
-    reasoning_content = getattr(message, "reasoning_content", None)
-    provider_fields = getattr(message, "provider_specific_fields", None) or {}
-    reasoning_details = provider_fields.get("reasoning_details", [])
-
-    if reasoning_content:
+    # --- Extract reasoning, including encrypted and signed details ---
+    fields = reasoning_fields(message)
+    reasoning_content = fields.get("reasoning_content")
+    if fields:
         # Build reasoning item compatible with Responses API format
         reasoning_item: Dict[str, Any] = {
             "type": "reasoning",
-            "summary": [{"type": "summary_text", "text": reasoning_content}],
+            "summary": ([{"type": "summary_text", "text": reasoning_content}]
+                        if reasoning_content else []),
+            **fields,
         }
-        # Preserve signature if available (for Anthropic replay)
-        if reasoning_details:
-            for rd in reasoning_details:
-                if isinstance(rd, dict) and rd.get("signature"):
-                    reasoning_item["signature"] = rd["signature"]
-                    break
         output_items.append(reasoning_item)
 
     # --- Extract text content ---
@@ -568,8 +598,12 @@ def _convert_response_to_output(response: Any) -> Dict[str, Any]:
         if "completion_tokens" in usage and "output_tokens" not in usage:
             usage["output_tokens"] = usage["completion_tokens"]
 
-    if hasattr(response, "_hidden_params"):
-        usage["response_cost"] = response._hidden_params.get("response_cost", 0.0)
+    hidden = getattr(response, "_hidden_params", None) or {}
+    cost = usage.get("cost")
+    if not isinstance(cost, (int, float)) and isinstance(hidden, dict):
+        cost = hidden.get("response_cost")
+    if isinstance(cost, (int, float)):
+        usage["response_cost"] = cost
 
     import builtins as _builtins
     import threading as _threading
@@ -795,6 +829,7 @@ class UnifiedAgentConfig(AsyncAgentConfig):
             "max_tokens": 200,
             "timeout": float(os.environ.get("LITELLM_REQUEST_TIMEOUT", "600.0")),
             "num_retries": int(os.environ.get("LITELLM_MAX_RETRIES", "1000")),
+            **model_generation_kwargs(model, model, kwargs),
         }
         # Pass through api_key/api_base if provided
         for k in ("api_key", "api_base"):

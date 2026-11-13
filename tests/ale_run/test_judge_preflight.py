@@ -20,8 +20,12 @@ def test_selected_task_requirements_are_deduplicated():
     }
 
 
+def test_digital_marketing_report_only_needs_text_judge():
+    task = "business_finance/digital_marketing_ab_test_analysis_1"
+    assert judge_preflight.judge_requirements([task]) == {"text": [task]}
+
+
 @pytest.mark.parametrize("task", [
-    "business_finance/odoo",
     "business_finance/saas_onepager_brand_refresh_instance_1",
     "engineering/2d_drawings_to_3d_building_model",
     "engineering/2d_drawings_to_3d_bridge_model",
@@ -80,6 +84,7 @@ async def test_failed_probe_prevents_entire_batch_from_starting(monkeypatch, tmp
     monkeypatch.setattr(evaluation, "llm_multimodal_json", probe)
     launch = AsyncMock()
     monkeypatch.setattr("ale_run.orchestration.lifecycle.run_one_unit", launch)
+    monkeypatch.setattr("ale_run.orchestration.host_preflight.check_host_dependencies", lambda _: None)
     spec = ExperimentSpec(
         name="preflight-test", output=OutputSpec(root=str(tmp_path)),
         environment=EnvironmentSpec(), agents=[], tasks=[],

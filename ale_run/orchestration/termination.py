@@ -12,6 +12,7 @@ Pure helpers:
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any
 
 _CATEGORY_PATTERNS: list[tuple[str, tuple[str, ...]]] = [
@@ -77,10 +78,18 @@ def classify_error(exc: BaseException) -> str | None:
 
 
 def redact_config(cfg: dict[str, Any]) -> dict[str, Any]:
-    def redact(value: Any, key: str | None = None) -> Any:
+    def redact(value: Any, key: Any = None) -> Any:
+        normalized_key = ""
+        if isinstance(key, str):
+            key = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", key)
+            normalized_key = re.sub(r"[^a-z0-9]+", "_", key.lower()).strip("_")
         if (
-            key is not None
-            and (key.lower() == "api_key" or key.lower().endswith("_api_key"))
+            any(
+                normalized_key == name or normalized_key.endswith("_" + name)
+                for name in ("api_key", "apikey", "key", "token", "accesstoken", "refreshtoken",
+                             "secret", "password", "credential", "credentials", "authorization",
+                             "auth", "auth_header")
+            )
             and isinstance(value, str)
             and value
         ):

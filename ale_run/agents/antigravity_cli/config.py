@@ -25,7 +25,7 @@ class AntigravityCliConfig:
 
     # Model display name as printed by ``agy models`` (accepted verbatim).
     # Empty => let agy use its configured default.
-    model: str = "Gemini 3.7 Flash (High)"
+    model: str = "Gemini 3.8 Flash (High)"
 
     # Bypass all tool-permission prompts (required headless). Maps to
     # ``--dangerously-skip-permissions``.

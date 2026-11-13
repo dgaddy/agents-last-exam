@@ -54,7 +54,14 @@
     </ul>
     <pre><code>docker info
 df -h .
-uv sync --all-packages</code></pre>
+bash env/install_host_deps.sh
+uv sync --all-packages --locked
+bash env/verify_host_env.sh</code></pre>
+    <p>
+      Complete the <a href="/pages/providers.html">host evaluation setup</a>
+      even when task applications are already installed in the container image.
+      The host installer supports Ubuntu 22.04/24.04/26.04 and Debian 12/13.
+    </p>
 
     <h2>Fetch task data once</h2>
     <p>
@@ -63,7 +70,7 @@ uv sync --all-packages</code></pre>
       <a href="https://huggingface.co/datasets/agents-last-exam/agents-last-exam-data-archive">ALE
       task-data archive</a>, authenticate with Hugging Face, then run:
     </p>
-    <pre><code>huggingface-cli login
+    <pre><code>uv run hf auth login
 REVISION=$(jq -r '.huggingface.archive.revision' releases/v1.1/assets.json)
 SHA256=$(jq -r '.task_data.archive_sha256' releases/v1.1/assets.json)
 scripts/fetch_task_data.sh --revision "$REVISION" --sha256 "$SHA256"</code></pre>
@@ -73,8 +80,8 @@ scripts/fetch_task_data.sh --revision "$REVISION" --sha256 "$SHA256"</code></pre
       Before the agent runs, ALE copies <code>input/</code> and
       <code>software/</code> into the container. It copies
       <code>reference/</code> only after the agent finishes.
-      The unchanged archive packages 150 tasks, including 28 inactive payloads;
-      only tasks on the active selection list are staged.
+      The archive contains data for the 122 selected tasks; only the current
+      task is staged for a run.
     </p>
 
     <h2>Use the shipped environment</h2>

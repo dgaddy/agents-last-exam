@@ -51,6 +51,15 @@
     </p>
 
     <h2>Host requirements</h2>
+    <p>Install and verify the host evaluation environment from the repository root:</p>
+    <pre><code>bash env/install_host_deps.sh
+uv sync --all-packages --locked
+bash env/verify_host_env.sh</code></pre>
+    <p>
+      These dependencies run outside the guest, including for Windows tasks.
+      See <a href="/pages/providers.html">host setup</a> for supported distributions
+      and validation scope. Docker and KVM must also be available:
+    </p>
     <ul>
       <li>A Linux host.</li>
       <li>Docker available to the current user.</li>
@@ -103,9 +112,7 @@ ps -eo pid,comm,args | rg '[q]emu-system'</code></pre>
       shipped profile; see <a href="/pages/configure.html#v1-1">release pins</a>.
     </p>
     <p>
-      Published payloads are unchanged: standalone data packages 150 tasks
-      (28 inactive), and VM disks package 151 (29 inactive, including PDE).
-      Inactive payloads are not selected or counted among the 122 active tasks.
+      Hugging Face data packages cover the 122 selected tasks.
       To run legacy disks with v1 code and fresh logs, use the
       <a href="https://github.com/rdi-berkeley/agents-last-exam/blob/main/docs/releases/v1.md">original v1 guide</a>.
     </p>
@@ -155,7 +162,7 @@ uv run python -m ale_run run local_vm_demo.yaml</code></pre>
     <h2>Task coverage</h2>
     <p>
       <code>cpu.txt</code> contains 119 CPU tasks:
-      all 86 <code>cpu-free-ubuntu</code> tasks and 32 <code>cpu-free</code>
+      all 86 <code>cpu-free-ubuntu</code> tasks and 33 <code>cpu-free</code>
       Windows tasks. QEMU supports only CPU tasks. Run the three Windows GPU
       tasks in <code>selected_tasks/gpu.txt</code> with
       <code>configs/environments/environment_gcloud.yaml</code>.

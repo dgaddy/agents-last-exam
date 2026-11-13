@@ -19,6 +19,7 @@ normal cleanup.
 
 ## Host requirements
 
+- Complete the [host evaluation setup](../env/README.md#host-evaluation-environment)
 - Linux with hardware virtualization or nested virtualization enabled
 - Docker daemon available to the current user
 - `/dev/kvm` present and passable through the Docker daemon
@@ -26,6 +27,18 @@ normal cleanup.
 - Sufficient disk for the cached base images
 - `huggingface-hub` for `hf://` disks, installed with the project dependencies
 - `gcloud` or `gsutil` when `qemu.disk_source` is a `gs://` URI
+
+From the repository root, install and check the host evaluator before downloading
+VM images. These dependencies run outside the guest, including for Windows tasks:
+
+```bash
+bash env/install_host_deps.sh
+uv sync --all-packages --locked
+bash env/verify_host_env.sh
+```
+
+The installer supports Ubuntu 22.04/24.04/26.04 and Debian 12/13. Docker, KVM,
+cloud authentication, and guest applications remain provider prerequisites.
 
 The published base images are:
 
@@ -39,9 +52,7 @@ of the environment configuration.
 
 Use `configs/environments/qemu.yaml` as the starting configuration, preserving
 each snapshot's `image_revision` pin from the [release manifest](../releases/v1.1/assets.json).
-Published payloads are unchanged: standalone data packages 150 tasks (28
-inactive), and VM disks package 151 (29 inactive, including PDE). Inactive
-payloads are not selected; v1.1 has 122 active tasks. See the
+Hugging Face data packages cover the 122 selected tasks. See the
 [release guide](releases/v1.1.md) or [original v1 setup](releases/v1.md).
 
 ## Check capacity and run

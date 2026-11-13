@@ -32,10 +32,10 @@ class GrokBuildConfig:
     max_turns: int | None = None
 
     disabled_tools: tuple[str, ...] = ()
-    """Additional tools to remove beyond ALE's mandatory headless exclusions."""
+    """Tools to remove from the CLI's defaults; empty by default."""
 
     otel_enabled: bool = True
     """Capture Grok Build's native external OpenTelemetry stream run-locally."""
 
-    cli_version: str = "@xai-official/grok@0.2.112"
+    cli_version: str = "@xai-official/grok@1.0.62"
     """Pinned official npm package installed dynamically when missing or stale."""

@@ -4,11 +4,12 @@ import asyncio
 import ctypes
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -22,8 +23,6 @@ from ale_run.executors.local import LocalExecutor
 from ale_run.executors.docker import DockerExecutor
 from ale_run.executors import docker as docker_module
 from ale_run.executors.sandbox import SandboxExecutor
-from ale_run.orchestration import lifecycle
-from ale_run.orchestration.experiment_spec import AgentSpec, RunUnit
 
 
 @dataclass
@@ -41,7 +40,12 @@ class TreeDeployer:
         self.executor = executor
 
     async def install(self):
-        pass
+        if self.executor.config.mode == "install_timeout":
+            raise TimeoutError("plugin inspection timed out")
+        if self.executor.config.mode == "install_failure":
+            raise RuntimeError("plugin installation failed")
+        if self.executor.config.mode == "install_hang":
+            await asyncio.Event().wait()
 
     async def launch(self, prompt):
         work = Path(self.executor.work_dir)
@@ -112,6 +116,12 @@ class DiskSandbox(SandboxHandle):
         return Path(path).exists()
 
     async def run_command(self, command, *, timeout=60):
+        if command.startswith("chmod +x "):
+            spec_path = Path(shlex.split(command)[-1]).with_name("_spec.json")
+            returncode = await asyncio.to_thread(
+                entry.launch, spec_path, json.loads(spec_path.read_text()),
+            )
+            return subprocess.CompletedProcess(command, returncode, "", "")
         return await asyncio.to_thread(
             subprocess.run, command, shell=True, capture_output=True, text=True, timeout=timeout,
         )
@@ -124,6 +134,7 @@ def disk_executor(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "PYTHONPATH", os.pathsep.join([str(Path(__file__).parent), str(Path.cwd())]),
     )
+    monkeypatch.setattr(entry, "_SYSTEMD_RUNTIME", tmp_path / "no-systemd")
     sandbox = DiskSandbox(
         id="test", endpoint="unused", os="linux", work_dir_base=str(tmp_path),
         task_data_root=str(tmp_path), python=sys.executable, node="unused", mcp_server_dir="unused",
@@ -226,6 +237,130 @@ async def test_background_work_uses_remaining_budget(contained_executor):
     assert time.monotonic() - started >= 5
     assert not (work / "output.complete").exists()
     assert_tree_stopped(executor)
+
+
+@pytest.mark.parametrize("mode", ["install_timeout", "install_failure", "install_hang"])
+async def test_real_install_failure_never_marks_launch(contained_executor, mode):
+    executor = contained_executor
+    executor.config.mode = mode
+    result = await asyncio.wait_for(executor.run_deployer(
+        deployer_cls=TreeDeployer, prompt="test", timeout_s=2,
+    ), timeout=8)
+    assert result.status == ("timeout" if mode == "install_hang" else "failed")
+    work = Path(executor.work_dir)
+    assert not (work / "_agent_started").exists()
+    assert not (work / "worker.pid").exists()
+    assert json.loads((work / "_stopped.json").read_text())["stopped"] is True
+    if mode != "install_hang":
+        assert json.loads((work / "_worker_result.json").read_text())["phase"] == "install"
+
+
+@pytest.mark.parametrize("mode", ["install_timeout", "install_failure", "install_hang"])
+async def test_lifecycle_real_install_failure_skips_evaluation(
+    tmp_path, monkeypatch, contained_executor, mode,
+):
+    from ale_run.orchestration import lifecycle
+    from ale_run.orchestration.experiment_spec import AgentSpec, RunUnit
+
+    monkeypatch.chdir(tmp_path)
+    task_directory = tmp_path / "tasks" / "demo" / "test"
+    task_directory.mkdir(parents=True)
+    (task_directory / "main.py").write_text("value = 1\n")
+    executor = contained_executor
+    executor.config.mode = mode
+    env = SimpleNamespace(
+        sandbox=executor.sandbox, session=None, current_phase=None, reset_async=AsyncMock(),
+        close_async=AsyncMock(), reset_session=Mock(),
+    )
+    env.set_phase = lambda phase: setattr(env, "current_phase", phase)
+    driver = SimpleNamespace(
+        setup=AsyncMock(), close=AsyncMock(), evaluate=AsyncMock(), evaluation_timeout_s=None,
+    )
+    executor.gather_dir = AsyncMock(return_value=GatherReport(transport="local"))
+    reference = AsyncMock()
+    monkeypatch.setattr(lifecycle, "resolve_agent", lambda spec: (TreeDeployer, TreeConfig))
+    monkeypatch.setattr(lifecycle, "ALEEnv", lambda **kwargs: env)
+    monkeypatch.setattr(lifecycle, "TaskLoader", lambda path: SimpleNamespace(load=lambda variant: {
+        "description": "test", "snapshot_name": "fake",
+    }))
+    monkeypatch.setattr(lifecycle, "TaskDriver", lambda **kwargs: driver)
+    monkeypatch.setattr(lifecycle, "_build_executor", lambda **kwargs: executor)
+    monkeypatch.setattr(lifecycle, "_stage_task_data", AsyncMock())
+    monkeypatch.setattr(lifecycle, "stage_reference", reference)
+    result = await asyncio.wait_for(lifecycle.run_one_unit(
+        unit=RunUnit("fake", AgentSpec("fake", "fake", executor=executor.type), "demo/test", 0),
+        router=SimpleNamespace(provider_for=lambda snapshot: None),
+        output_root=tmp_path, wall_time_s=3,
+    ), timeout=10)
+    metadata = json.loads((result.run_dir / "run.json").read_text())
+    evaluation = json.loads((result.run_dir / "eval_result.json").read_text())
+    assert result.status == metadata["status"] == "failed"
+    assert result.score is None and metadata["score"] is None
+    assert result.eval_status == "not_executed"
+    assert evaluation["eval_status"] == "not_executed" and evaluation["score"] is None
+    reference.assert_not_awaited()
+    driver.evaluate.assert_not_awaited()
+    executor.gather_dir.assert_awaited_once()
+    env.close_async.assert_awaited_once()
+
+
+@pytest.mark.parametrize("finishes", [False, True])
+async def test_sigkilled_worker_without_result_preserves_live_orphan(disk_executor, finishes):
+    executor = disk_executor
+    work = Path(executor.work_dir)
+    work.mkdir()
+    budget_s = 4
+    spec_path = work / "_spec.json"
+    spec_path.write_text(json.dumps({
+        "work_dir": str(work), "run_token": executor._run_token, "timeout_s": budget_s,
+        "deployer_module": __name__, "deployer_class": "TreeDeployer",
+        "config_module": __name__, "config_class": "TreeConfig",
+        "config_kwargs": asdict(TreeConfig(
+            mode="hang", tool_duration_s=1.5 if finishes else 30,
+        )),
+        "sandbox_kwargs": asdict(executor.sandbox), "prompt": "test",
+        "install_agent_deps": False,
+    }))
+    with (work / "_entry.log").open("wb") as log:
+        supervisor = subprocess.Popen(
+            [sys.executable, "-m", "ale_run.executors._sandbox_entry", str(spec_path)],
+            stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
+        )
+    try:
+        await wait_ready(executor)
+        os.kill(int((work / "worker.pid").read_text()), signal.SIGKILL)
+        async with asyncio.timeout(2):
+            while "without _worker_result.json" not in (work / "_entry.log").read_text():
+                await asyncio.sleep(0.01)
+        heartbeat = (work / "heartbeat").read_bytes()
+        await asyncio.sleep(0.2)
+        assert (work / "heartbeat").read_bytes() != heartbeat
+        assert supervisor.poll() is None
+        assert not (work / "_worker_result.json").exists()
+        assert not (work / "_done.marker").exists()
+        assert not (work / "_stopped.json").exists()
+        assert not (work / "_stop.request").exists()
+        await asyncio.to_thread(supervisor.wait, timeout=budget_s + 5)
+        assert supervisor.returncode == 0
+        result = json.loads((work / "_result.json").read_text())
+        assert result["status"] == ("failed" if finishes else "timeout")
+        assert result["exit_code"] == -signal.SIGKILL
+        assert "worker exited with code -9" in result["error"]
+        assert "without _worker_result.json" in result["error"]
+        assert (work / "output.complete").exists() is finishes
+        if not finishes:
+            assert result["duration_s"] >= budget_s
+            assert "solver budget exceeded" in result["error"]
+        assert_tree_stopped(executor)
+        report = json.loads((work / "_stopped.json").read_text())
+        assert "worker exited with code -9" in report["error"]
+    finally:
+        (work / "_stop.request").write_text(executor._run_token)
+        try:
+            await asyncio.to_thread(supervisor.wait, timeout=5)
+        except subprocess.TimeoutExpired:
+            supervisor.kill()
+            await asyncio.to_thread(supervisor.wait, timeout=5)
 
 
 @pytest.mark.parametrize("cause", ["cancel", "outer_timeout", "transport_error"])
@@ -346,8 +481,18 @@ async def test_late_launcher_cannot_restart_stopped_solver(disk_executor):
     assert_tree_stopped(executor)
 
 
-@pytest.mark.parametrize("mode", ["completed", "hang", "failed", "cancel", "unconfirmed"])
+@pytest.mark.parametrize("mode", [
+    "completed", "hang", "failed", "cancel", "unconfirmed", "failed_unconfirmed",
+    "sandbox_unconfirmed", "sandbox_exception_unconfirmed", "sandbox_timeout",
+    "sandbox_completed_recovery", "sandbox_failed_recovery", "sandbox_failed_recovery_failed",
+    "sandbox_timeout_recovery_failed", "sandbox_timeout_gather_failed", "sandbox_timeout_parse_failed",
+    "install_timeout", "install_failure", "install_outer_timeout", "sandbox_install_timeout",
+    "launch_marker_unavailable",
+])
 async def test_lifecycle_stops_before_reference_and_evaluation(tmp_path, monkeypatch, mode):
+    from ale_run.orchestration import lifecycle
+    from ale_run.orchestration.experiment_spec import AgentSpec, RunUnit
+
     monkeypatch.chdir(tmp_path)
     task_directory = tmp_path / "tasks" / "demo" / "test"
     task_directory.mkdir(parents=True)
@@ -361,22 +506,42 @@ async def test_lifecycle_stops_before_reference_and_evaluation(tmp_path, monkeyp
     env = SimpleNamespace(sandbox=sandbox, session=None, current_phase=None,
                           reset_async=AsyncMock(), close_async=AsyncMock(), reset_session=Mock())
     env.set_phase = lambda phase: setattr(env, "current_phase", phase)
-    executor = SimpleNamespace(work_dir=str(tmp_path), stopped=False)
+    if mode.startswith("sandbox_"):
+        executor = SandboxExecutor(config=TreeConfig(), work_dir=str(tmp_path), sandbox=sandbox)
+        executor.stopped = False
+    else:
+        executor = SimpleNamespace(work_dir=str(tmp_path), stopped=False)
 
     async def run(**kwargs):
         events.append("run")
         started.set()
-        if mode in ("hang", "cancel"):
+        if mode in ("hang", "cancel", "install_outer_timeout"):
             await asyncio.Event().wait()
-        if mode == "failed":
+        if mode in ("install_timeout", "install_failure", "sandbox_install_timeout",
+                    "launch_marker_unavailable"):
+            return AgentRunResult(status="failed", error="installation failed")
+        if mode in ("failed", "failed_unconfirmed", "sandbox_exception_unconfirmed"):
             raise RuntimeError("launch failure")
+        if mode == "sandbox_unconfirmed":
+            return AgentRunResult(
+                status="failed", error="original worker failure", pid=42, exit_code=-9,
+            )
+        if mode.startswith("sandbox_timeout"):
+            return AgentRunResult(status="timeout", error="agent timed out")
+        if mode.startswith("sandbox_failed_recovery"):
+            return AgentRunResult(status="failed", error="gateway exited")
         return AgentRunResult(status="completed")
 
     async def stop():
         events.append("stop")
         await asyncio.sleep(0.01)
-        if mode == "unconfirmed":
-            raise RuntimeError("termination unconfirmed")
+        if mode.endswith("unconfirmed"):
+            records = [
+                json.loads(line)
+                for line in next(tmp_path.rglob("events.jsonl")).read_text().splitlines()
+            ]
+            assert any(record["type"] == "agent_run_result" for record in records)
+            raise RuntimeError(f"termination unconfirmed on stop {events.count('stop')}")
         executor.stopped = True
         events.append("stopped")
 
@@ -389,10 +554,33 @@ async def test_lifecycle_stops_before_reference_and_evaluation(tmp_path, monkeyp
         events.append("evaluate")
         return {"score": 1.0}
 
-    executor.run_deployer = run
+    if isinstance(executor, SandboxExecutor):
+        executor._run_deployer = run
+    else:
+        executor.run_deployer = run
     executor.stop_deployer = stop
     executor.gather_dir = AsyncMock(return_value=GatherReport(transport="local"))
-    driver = SimpleNamespace(setup=AsyncMock(), close=AsyncMock(), evaluate=evaluate)
+    if mode.startswith(("sandbox_timeout", "sandbox_completed_recovery", "sandbox_failed_recovery")):
+        async def recover(sandbox, work_dir):
+            assert executor.stopped
+            events.append("recover")
+            if mode.endswith("recovery_failed"):
+                raise RuntimeError("transcript recovery failed")
+            return {"transcript.jsonl": "expected"}
+        def validate(work_dir, manifest):
+            events.append("validate")
+            assert manifest == {"transcript.jsonl": "expected"}
+            if mode.endswith("gather_failed"):
+                raise RuntimeError("transcript gather failed")
+        monkeypatch.setattr(TreeDeployer, "recover_stopped_artifacts", recover, raising=False)
+        monkeypatch.setattr(TreeDeployer, "validate_recovered_artifacts", validate, raising=False)
+        if mode == "sandbox_timeout_parse_failed":
+            def fail_parse(**kwargs):
+                raise ValueError("malformed transcript")
+            monkeypatch.setattr(TreeDeployer, "parse_artifacts", fail_parse)
+    driver = SimpleNamespace(
+        setup=AsyncMock(), close=AsyncMock(), evaluate=evaluate, evaluation_timeout_s=None,
+    )
     monkeypatch.setattr(lifecycle, "resolve_agent", lambda spec: (TreeDeployer, TreeConfig))
     monkeypatch.setattr(lifecycle, "ALEEnv", lambda **kwargs: env)
     monkeypatch.setattr(lifecycle, "TaskLoader", lambda path: SimpleNamespace(load=lambda variant: {
@@ -403,6 +591,12 @@ async def test_lifecycle_stops_before_reference_and_evaluation(tmp_path, monkeyp
     monkeypatch.setattr(lifecycle, "_stage_task_data", AsyncMock())
     monkeypatch.setattr(lifecycle, "pull_agent_output", AsyncMock())
     monkeypatch.setattr(lifecycle, "stage_reference", reference)
+    launch_check = AsyncMock(return_value=mode not in (
+        "install_timeout", "install_failure", "install_outer_timeout", "sandbox_install_timeout",
+    ))
+    if mode == "launch_marker_unavailable":
+        launch_check.side_effect = RuntimeError("sandbox transport unavailable")
+    monkeypatch.setattr(lifecycle, "_agent_launch_started", launch_check)
     operation = asyncio.create_task(lifecycle.run_one_unit(
         unit=RunUnit("fake", AgentSpec("fake", "fake", executor="sandbox"), "demo/test", 0),
         router=SimpleNamespace(provider_for=lambda snapshot: None),
@@ -419,16 +613,108 @@ async def test_lifecycle_stops_before_reference_and_evaluation(tmp_path, monkeyp
         metadata = json.loads((result.run_dir / "run.json").read_text())
         assert metadata["task"]["revision"] == expected_revision
         assert metadata["environment"]["image_revision"] == "test-image"
-        if mode == "unconfirmed":
+        if mode.endswith("unconfirmed"):
             assert result.status == "failed"
             assert result.eval_status == "not_executed"
+            records = [
+                json.loads(line)
+                for line in (result.run_dir / "events.jsonl").read_text().splitlines()
+            ]
+            record_types = [record["type"] for record in records]
+            assert record_types.index("agent_run_result") < record_types.index(
+                "agent_stop_failed",
+            )
+            assert "agent_finished" not in record_types
+            traceback_text = metadata["termination"]["error"]["traceback"]
+            if mode == "sandbox_unconfirmed":
+                primary = next(
+                    record["data"] for record in records if record["type"] == "agent_run_result"
+                )
+                assert primary["error"] == "original worker failure"
+                assert primary["pid"] == 42
+                assert primary["exit_code"] == -9
+                assert "original worker failure" in traceback_text
+            if mode in ("failed_unconfirmed", "sandbox_exception_unconfirmed"):
+                assert "launch failure" in traceback_text
+            if mode.startswith("sandbox_"):
+                assert "unconfirmed on stop 1" in traceback_text
+                assert "unconfirmed on stop 2" in traceback_text
+        elif mode in ("sandbox_timeout_recovery_failed", "sandbox_timeout_gather_failed",
+                      "sandbox_failed_recovery_failed",
+                      "install_timeout", "install_failure", "install_outer_timeout",
+                      "sandbox_install_timeout", "launch_marker_unavailable"):
+            assert result.status == "failed"
+            assert result.eval_status == "not_executed"
+            assert result.score is None
+            assert "reference" not in events and "evaluate" not in events
+            if mode in ("sandbox_timeout_recovery_failed", "sandbox_failed_recovery_failed"):
+                executor.gather_dir.assert_awaited_once()
+            if mode in ("install_timeout", "install_failure", "install_outer_timeout",
+                        "sandbox_install_timeout", "launch_marker_unavailable"):
+                assert metadata["termination"]["phase"] == "agent_start"
+                assert "agent launch not confirmed" in result.error
+                executor.gather_dir.assert_awaited_once()
+                records = [json.loads(line) for line in (result.run_dir / "events.jsonl").read_text().splitlines()]
+                finished = next(record["data"] for record in records if record["type"] == "agent_finished")
+                assert finished["status"] == "failed"
+                assert finished["launch_confirmed"] is False
+        elif mode == "sandbox_timeout_parse_failed":
+            assert result.status == "failed"
+            assert result.eval_status == "failed"
+            assert result.score is None
+            assert "evaluate" in events
         else:
-            assert result.status == {"hang": "timeout", "failed": "failed"}.get(mode, "completed")
+            assert result.status == {"hang": "timeout", "failed": "failed", "sandbox_timeout": "timeout",
+                                     "sandbox_failed_recovery": "failed"}.get(mode, "completed")
             assert events.index("stopped") < events.index("reference") < events.index("evaluate")
-    if mode in ("cancel", "unconfirmed"):
+            if mode == "sandbox_timeout":
+                assert events.index("stopped") < events.index("recover") < events.index("reference")
+                assert events.index("recover") < events.index("validate") < events.index("reference")
+                assert metadata["termination"]["phase"] == "agent_run"
+            if mode in ("sandbox_completed_recovery", "sandbox_failed_recovery"):
+                assert events.index("stopped") < events.index("recover") < events.index("validate") < events.index("reference")
+    if mode == "cancel" or mode.endswith("unconfirmed"):
         assert "reference" not in events
         assert "evaluate" not in events
     env.close_async.assert_awaited_once_with(mode="keep")
+
+
+@pytest.mark.parametrize("executor_type", ["local", "docker"])
+async def test_launch_marker_host_executors(tmp_path, executor_type):
+    from ale_run.orchestration.lifecycle import _agent_launch_started
+
+    executor_class = LocalExecutor if executor_type == "local" else DockerExecutor
+    executor = executor_class(config=None, work_dir=str(tmp_path), sandbox=None)
+    (tmp_path / "_spec.json").write_text(json.dumps({"run_token": "current"}))
+    marker = tmp_path / "_agent_started"
+    assert not await _agent_launch_started(executor)
+    marker.write_text("stale")
+    with pytest.raises(RuntimeError, match="invalid agent launch marker"):
+        await _agent_launch_started(executor)
+    marker.write_text("current")
+    assert await _agent_launch_started(executor)
+
+
+@pytest.mark.parametrize("os_type", ["linux", "windows"])
+async def test_launch_marker_sandbox_executor(tmp_path, os_type):
+    from ale_run.orchestration.lifecycle import _agent_launch_started
+
+    sandbox = SimpleNamespace(is_linux=os_type == "linux", read_text=AsyncMock())
+    executor = SandboxExecutor(config=None, work_dir="work", sandbox=sandbox)
+    sandbox.read_text.side_effect = FileNotFoundError
+    assert not await _agent_launch_started(executor)
+    sandbox.read_text.side_effect = None
+    sandbox.read_text.return_value = "stale"
+    with pytest.raises(RuntimeError, match="invalid agent launch marker"):
+        await _agent_launch_started(executor)
+    sandbox.read_text.return_value = executor._run_token
+    assert await _agent_launch_started(executor)
+    sandbox.read_text.assert_awaited_with(
+        "work/_agent_started" if os_type == "linux" else "work\\_agent_started",
+    )
+    sandbox.read_text.side_effect = RuntimeError("transport unavailable")
+    with pytest.raises(RuntimeError, match="transport unavailable"):
+        await _agent_launch_started(executor)
 
 
 async def test_local_executor_without_launch_is_safe_to_stop(tmp_path):
@@ -591,6 +877,24 @@ def test_windows_job_disallows_breakaway_and_waits_for_empty(windows_kernel):
     windows_kernel.TerminateJobObject.assert_called_once()
 
 
+def test_windows_install_failure_stops_remaining_processes(tmp_path, monkeypatch, windows_kernel):
+    worker = Mock(pid=123, returncode=0)
+    worker.poll.return_value = 0
+    worker.stdin.closed = False
+    monkeypatch.setattr(entry.sys, "platform", "win32")
+    monkeypatch.setattr(entry.subprocess, "Popen", Mock(return_value=worker))
+    (tmp_path / "_worker_result.json").write_text(json.dumps({
+        "ok": False, "status": "failed", "phase": "install", "error": "plugin timed out",
+    }))
+    result = entry.supervise(tmp_path / "_spec.json", {
+        "work_dir": str(tmp_path), "run_token": "test", "timeout_s": 30,
+    })
+    assert result["status"] == "failed"
+    assert result["phase"] == "install"
+    windows_kernel.TerminateJobObject.assert_called_once()
+    assert json.loads((tmp_path / "_stopped.json").read_text())["stopped"] is True
+
+
 @pytest.mark.parametrize("failure", ["CreateJobObjectW", "SetInformationJobObject",
                                     "OpenProcess", "AssignProcessToJobObject",
                                     "TerminateJobObject", "QueryInformationJobObject"])
@@ -615,10 +919,12 @@ def test_windows_job_live_descendants_fail_closed(windows_kernel, monkeypatch):
 
 
 @pytest.mark.parametrize("finishes", [False, True])
+@pytest.mark.parametrize("missing_result", [False, True])
 def test_windows_waits_for_background_work_before_cleanup(
-    tmp_path, monkeypatch, windows_kernel, finishes,
+    tmp_path, monkeypatch, windows_kernel, finishes, missing_result,
 ):
     worker = Mock(pid=123)
+    worker.returncode = -9 if missing_result else 0
     worker.poll.return_value = 0
     worker.stdin.closed = False
     elapsed = [0.0]
@@ -635,14 +941,20 @@ def test_windows_waits_for_background_work_before_cleanup(
         return 1
 
     windows_kernel.QueryInformationJobObject.side_effect = query
-    (tmp_path / "_worker_result.json").write_text(json.dumps({
-        "ok": True, "status": "completed", "transcript_path": "transcript.jsonl",
-    }))
+    if not missing_result:
+        (tmp_path / "_worker_result.json").write_text(json.dumps({
+            "ok": True, "status": "completed", "transcript_path": "transcript.jsonl",
+        }))
     out = entry.supervise(tmp_path / "_spec.json", {
         "work_dir": str(tmp_path), "run_token": "test", "timeout_s": 1,
     })
-    assert out["status"] == ("completed" if finishes else "timeout")
-    assert out["transcript_path"] == "transcript.jsonl"
+    assert out["status"] == (
+        ("failed" if missing_result else "completed") if finishes else "timeout"
+    )
+    if missing_result:
+        assert "worker exited with code -9" in out["error"]
+    else:
+        assert out["transcript_path"] == "transcript.jsonl"
     if finishes:
         assert 0.5 <= out["duration_s"] < 1
         windows_kernel.TerminateJobObject.assert_not_called()
@@ -650,6 +962,36 @@ def test_windows_waits_for_background_work_before_cleanup(
         assert out["duration_s"] >= 1
         windows_kernel.TerminateJobObject.assert_called_once()
     assert json.loads((tmp_path / "_stopped.json").read_text())["stopped"] is True
+
+
+@pytest.mark.parametrize("missing_result", [False, True])
+def test_worker_result_and_cleanup_exceptions_remain_visible(
+    tmp_path, monkeypatch, windows_kernel, missing_result,
+):
+    worker = Mock(pid=123, returncode=-9)
+    worker.poll.return_value = -9
+    worker.stdin.closed = False
+    monkeypatch.setattr(entry.sys, "platform", "win32")
+    monkeypatch.setattr(entry.subprocess, "Popen", Mock(return_value=worker))
+    windows_kernel.QueryInformationJobObject.side_effect = RuntimeError("containment query failed")
+    windows_kernel.TerminateJobObject.return_value = 0
+    if not missing_result:
+        (tmp_path / "_worker_result.json").write_text("invalid JSON")
+
+    out = entry.supervise(tmp_path / "_spec.json", {
+        "work_dir": str(tmp_path), "run_token": "test", "timeout_s": 1,
+    })
+
+    assert out["status"] == "failed"
+    assert "process cleanup" in out["error"]
+    assert "Windows API failed" in out["traceback"]
+    if missing_result:
+        assert "worker exited with code -9" in out["error"]
+        assert "containment query failed" in out["traceback"]
+    else:
+        assert "JSONDecodeError" in out["traceback"]
+        assert "without _worker_result.json" not in out["error"]
+    assert json.loads((tmp_path / "_stopped.json").read_text())["stopped"] is False
 
 
 @pytest.mark.parametrize("assignment_fails", [False, True])

@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
+import copy
+import hashlib
 import json
 import logging
 import os
+import platform
+import re
 import shutil
 import subprocess
 import time
 import tempfile
+import urllib.request
+import zipfile
 from pathlib import Path
 from typing import ClassVar
 
@@ -36,12 +43,18 @@ from .config import ZCodeConfig
 
 logger = logging.getLogger(__name__)
 
-_POLL_INTERVAL_S = 5.0
 _TERM_GRACE_S = 3.0
 
 _REPO_URL = "https://github.com/zai-org/ZCode.git"
 _PNPM_VERSION = "10.33.2"
 _CLI_DIST_RELPATH = "apps/zcode-cli/packages/cli/dist/zcode.cjs"
+_NODE_VERSION = "24.14.0"
+_WINDOWS_PROMPT_LOADER = (
+    "const fs = require('node:fs'); const cli = process.argv[1]; "
+    "process.argv = [process.argv[0], cli, '-p', "
+    "fs.readFileSync(process.env.ALE_ZCODE_PROMPT_FILE, 'utf8'), ...process.argv.slice(2)]; "
+    "require(cli);"
+)
 
 _BUILTIN_PROVIDER_CONFIG_FILE_ENV = "ZCODE_BUILTIN_PROVIDER_CONFIG_FILE"
 _PERSONAL_PROVIDER_CONFIG_FILE_ENV = "ZCODE_PERSONAL_PROVIDER_CONFIG_FILE"
@@ -57,14 +70,11 @@ class ZCodeDeployer(BaseAgentDeployer):
     @property
     def version(self) -> str | None:
         cfg: ZCodeConfig = self.config  # type: ignore[assignment]
-        return f"src:{getattr(self, '_resolved_ref', cfg.cli_ref)}"
+        return f"src:{getattr(self, '_resolved_ref', cfg.cli_version)}"
 
     async def install(self) -> None:
         cfg: ZCodeConfig = self.config  # type: ignore[assignment]
         sandbox = self.executor.sandbox
-
-        if not sandbox.is_linux:
-            raise NotImplementedError("zcode is Linux-only")
 
         if not cfg.api_key:
             raise RuntimeError(
@@ -76,46 +86,78 @@ class ZCodeDeployer(BaseAgentDeployer):
         from ale_run.agents._bootstrap import ensure_node_npm
 
         node, npm = await ensure_node_npm()
-        node = await ensure_cli_node(node, npm, (24, 14, 0))
+        if sandbox.is_linux:
+            node = await ensure_cli_node(node, npm, (24, 14, 0))
+        else:
+            node = await self._ensure_windows_node(node)
+            npm = str(Path(node).parent / "node_modules/npm/bin/npm-cli.js")
+            if not Path(npm).is_file():
+                raise RuntimeError("zcode: Windows Node runtime must include npm-cli.js")
+            if not shutil.which("git"):
+                for directory in (
+                    Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Git/cmd",
+                    Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local"))
+                    / "Programs/Git/cmd",
+                ):
+                    if (directory / "git.exe").is_file():
+                        os.environ["PATH"] = (
+                            str(directory) + os.pathsep + os.environ.get("PATH", "")
+                        )
+                        break
+                if not shutil.which("git"):
+                    raise RuntimeError(
+                        "zcode: Git for Windows is required to build the pinned source"
+                    )
         self._node_path = node
 
         pnpm = await self._ensure_pnpm(npm)
 
         repo_dir = Path(os.path.expanduser("~")) / ".zcode_build" / "ZCode"
-        t0 = time.monotonic()
-        await self._clone_or_update(repo_dir, cfg.cli_ref)
-        clone_s = time.monotonic() - t0
-
-        t0 = time.monotonic()
-        await self._pnpm_install(pnpm, repo_dir)
-        install_s = time.monotonic() - t0
-
-        t0 = time.monotonic()
-        await self._pnpm_build(pnpm, repo_dir)
-        build_s = time.monotonic() - t0
+        if await self._cached_build_matches(repo_dir, cfg.cli_version):
+            self._resolved_ref = cfg.cli_version
+            logger.info("zcode: reusing verified build at %s", self._resolved_ref)
+        else:
+            await self._clone_or_update(repo_dir, cfg.cli_version)
+            resolved = getattr(self, "_resolved_ref", None)
+            if resolved:
+                await self._verify_source(repo_dir, resolved)
+            await self._pnpm_install(pnpm, repo_dir)
+            await self._pnpm_build(pnpm, repo_dir)
+            if resolved:
+                await self._verify_source(repo_dir, resolved)
+            identity = await self._build_identity(repo_dir, getattr(self, "_resolved_ref", ""))
+            if identity is not None:
+                try:
+                    self._build_identity_path(repo_dir).write_text(json.dumps(identity), encoding="utf-8")
+                except OSError as exc:
+                    logger.warning("zcode: could not cache build identity: %s", exc)
 
         cli_path = repo_dir / _CLI_DIST_RELPATH
         if not cli_path.is_file():
             raise RuntimeError(f"zcode: build finished but {cli_path} does not exist")
         self._cli_path = cli_path
-        logger.info(
-            "zcode: built %s (clone=%.0fs install=%.0fs build=%.0fs)",
-            cli_path,
-            clone_s,
-            install_s,
-            build_s,
-        )
+        self.actual_cli_version = getattr(self, "_resolved_ref", None)
+        self.cli_source = "official"
+        logger.info("zcode: CLI ready at %s (revision %s)", cli_path, self.actual_cli_version)
 
-        # Provider config: two JSON files, env-var-addressed (see module
-        # docstring). Written under a stable per-run dir.
         wd = Path(self.executor.work_dir)
         wd.mkdir(parents=True, exist_ok=True)
         cfg_dir = Path(tempfile.mkdtemp(prefix=".ale-zcode-", dir=wd.parent))
         self._home_dir = str(cfg_dir)
         builtin_path = cfg_dir / "builtin_provider_config.json"
         personal_path = cfg_dir / "personal_provider_config.json"
-        write_private_json(builtin_path, self._build_builtin_config(cfg))
-        write_private_json(personal_path, self._build_personal_config(cfg))
+        upstream_builtin = json.loads(
+            (cli_path.parent / "provider/zcode-builtin.json").read_text(encoding="utf-8")
+        )
+        for path, value in (
+            (builtin_path, self._build_builtin_config(cfg, upstream_builtin)),
+            (personal_path, self._build_personal_config(cfg)),
+        ):
+            if sandbox.is_linux:
+                write_private_json(path, value)
+            else:
+                with path.open("x", encoding="utf-8") as handle:
+                    json.dump(value, handle, indent=2)
         self._provider_env = {
             _BUILTIN_PROVIDER_CONFIG_FILE_ENV: str(builtin_path),
             _PERSONAL_PROVIDER_CONFIG_FILE_ENV: str(personal_path),
@@ -128,16 +170,90 @@ class ZCodeDeployer(BaseAgentDeployer):
             cfg.base_url,
         )
 
+    @staticmethod
+    def _build_identity_path(repo_dir: Path) -> Path:
+        return repo_dir.parent / "zcode-build-identity.json"
+
+    async def _verify_source(self, repo_dir: Path, ref: str) -> None:
+        head = await self._run_command(["git", "-C", str(repo_dir), "rev-parse", "HEAD"], timeout=30)
+        if head.returncode or head.stdout.strip() != ref:
+            raise RuntimeError("zcode: source revision changed during installation")
+        clean = await self._run_command(["git", "-C", str(repo_dir), "diff", "--quiet", "HEAD", "--"], timeout=30)
+        if clean.returncode:
+            raise RuntimeError("zcode: source has modified tracked files or cannot be checked")
+
+    async def _build_identity(self, repo_dir: Path, ref: str) -> dict | None:
+        if not re.fullmatch(r"[0-9a-f]{40}", ref):
+            return None
+        cli = repo_dir / _CLI_DIST_RELPATH
+        builtin = cli.parent / "provider/zcode-builtin.json"
+        if not (repo_dir / ".git").is_dir() or not (repo_dir / "node_modules/.modules.yaml").is_file():
+            return None
+        try:
+            head = await self._run_command(["git", "-C", str(repo_dir), "rev-parse", "HEAD"], timeout=30)
+            clean = await self._run_command(["git", "-C", str(repo_dir), "diff", "--quiet", "HEAD", "--"], timeout=30)
+            node = await self._run_command([self._node_path, "--version"], timeout=30)
+            version = await self._run_command([self._node_path, str(cli), "version"], timeout=30)
+            if (head.returncode or head.stdout.strip() != ref or clean.returncode
+                    or node.returncode or version.returncode or not version.stdout.strip()):
+                return None
+            with cli.open("rb") as cli_stream, builtin.open("rb") as builtin_stream:
+                return {
+                    "revision": ref,
+                    "node_version": node.stdout.strip(),
+                    "cli_version": version.stdout.strip(),
+                    "cli_sha256": hashlib.file_digest(cli_stream, "sha256").hexdigest(),
+                    "builtin_sha256": hashlib.file_digest(builtin_stream, "sha256").hexdigest(),
+                }
+        except (OSError, subprocess.SubprocessError, TimeoutError):
+            return None
+
+    async def _cached_build_matches(self, repo_dir: Path, ref: str) -> bool:
+        try:
+            recorded = json.loads(self._build_identity_path(repo_dir).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        current = await self._build_identity(repo_dir, ref)
+        return current is not None and current == recorded
+
     async def _ensure_pnpm(self, npm: str) -> str:
+        if not self.executor.sandbox.is_linux:
+            prefix = Path.home() / ".zcode_build/tools"
+            pnpm = prefix / "node_modules/pnpm/bin/pnpm.cjs"
+            if pnpm.is_file():
+                probe = await self._run_command([str(pnpm), "--version"], timeout=30)
+                if probe.returncode == 0 and probe.stdout.strip() == _PNPM_VERSION:
+                    return str(pnpm)
+            result = await self._run_command(
+                [
+                    npm,
+                    "install",
+                    "--prefix",
+                    str(prefix),
+                    "--no-save",
+                    "--no-audit",
+                    "--no-fund",
+                    "--ignore-scripts",
+                    f"pnpm@{_PNPM_VERSION}",
+                ],
+                timeout=180,
+            )
+            if result.returncode or not pnpm.is_file():
+                raise RuntimeError("zcode: could not install private Windows pnpm")
+            probe = await self._run_command([str(pnpm), "--version"], timeout=30)
+            if probe.returncode or probe.stdout.strip() != _PNPM_VERSION:
+                raise RuntimeError("zcode: private Windows pnpm version mismatch")
+            return str(pnpm)
+
         pnpm = shutil.which("pnpm")
         if pnpm:
-            probe = await run_command([pnpm, "--version"], timeout=30)
+            probe = await self._run_command([pnpm, "--version"], timeout=30)
             if probe.returncode == 0 and probe.stdout.strip() == _PNPM_VERSION:
                 return pnpm
 
         corepack = shutil.which("corepack")
         if corepack:
-            proc = await run_command(
+            proc = await self._run_command(
                 [corepack, "prepare", f"pnpm@{_PNPM_VERSION}", "--activate"],
                 capture_output=True,
                 text=True,
@@ -146,7 +262,7 @@ class ZCodeDeployer(BaseAgentDeployer):
             if proc.returncode == 0:
                 pnpm = shutil.which("pnpm")
                 if pnpm:
-                    probe = await run_command([pnpm, "--version"], timeout=30)
+                    probe = await self._run_command([pnpm, "--version"], timeout=30)
                     if probe.returncode == 0 and probe.stdout.strip() == _PNPM_VERSION:
                         return pnpm
             logger.warning(
@@ -154,7 +270,7 @@ class ZCodeDeployer(BaseAgentDeployer):
                 proc.returncode,
             )
 
-        proc = await run_command(
+        proc = await self._run_command(
             [npm, "install", "-g", f"pnpm@{_PNPM_VERSION}"],
             capture_output=True,
             text=True,
@@ -168,7 +284,7 @@ class ZCodeDeployer(BaseAgentDeployer):
         pnpm = shutil.which("pnpm")
         if not pnpm:
             raise RuntimeError("zcode: pnpm installed via npm -g but still not on PATH")
-        probe = await run_command([pnpm, "--version"], timeout=30)
+        probe = await self._run_command([pnpm, "--version"], timeout=30)
         if probe.returncode != 0 or probe.stdout.strip() != _PNPM_VERSION:
             raise RuntimeError("zcode: pnpm on PATH does not match the required version")
         return pnpm
@@ -180,24 +296,32 @@ class ZCodeDeployer(BaseAgentDeployer):
                 ["git", "init", str(repo_dir)],
                 ["git", "-C", str(repo_dir), "remote", "add", "origin", _REPO_URL],
             ):
-                result = await run_command(command, timeout=60)
+                result = await self._run_command(command, timeout=60)
                 if result.returncode:
                     raise RuntimeError("zcode: could not initialize build source")
+        if not self.executor.sandbox.is_linux:
+            result = await self._run_command(
+                ["git", "-C", str(repo_dir), "config", "core.longpaths", "true"], timeout=30
+            )
+            if result.returncode:
+                raise RuntimeError("zcode: could not enable Windows Git long paths")
         for command in (
             ["git", "-C", str(repo_dir), "fetch", "--depth", "1", "origin", ref],
             ["git", "-C", str(repo_dir), "checkout", "--detach", "FETCH_HEAD"],
         ):
-            result = await run_command(command, timeout=300)
+            result = await self._run_command(command, timeout=300)
             if result.returncode:
-                raise RuntimeError("zcode: could not resolve requested cli_ref")
-        result = await run_command(["git", "-C", str(repo_dir), "rev-parse", "HEAD"], timeout=30)
+                raise RuntimeError("zcode: could not resolve requested cli_version")
+        result = await self._run_command(
+            ["git", "-C", str(repo_dir), "rev-parse", "HEAD"], timeout=30
+        )
         if result.returncode:
             raise RuntimeError("zcode: could not record source revision")
         self._resolved_ref = result.stdout.strip()
 
     async def _pnpm_install(self, pnpm: str, repo_dir: Path) -> None:
         env = {**os.environ, "ELECTRON_SKIP_BINARY_DOWNLOAD": "1"}
-        proc = await run_command(
+        proc = await self._run_command(
             [pnpm, "install", "--filter", "@zcode/cli..."],
             cwd=str(repo_dir),
             capture_output=True,
@@ -214,7 +338,7 @@ class ZCodeDeployer(BaseAgentDeployer):
 
     async def _pnpm_build(self, pnpm: str, repo_dir: Path) -> None:
         env = {**os.environ, "ELECTRON_SKIP_BINARY_DOWNLOAD": "1"}
-        proc = await run_command(
+        proc = await self._run_command(
             [pnpm, "--filter", "@zcode/cli...", "build"],
             cwd=str(repo_dir),
             capture_output=True,
@@ -229,73 +353,96 @@ class ZCodeDeployer(BaseAgentDeployer):
                 f"stderr: {(proc.stderr or '')[-1000:]}"
             )
 
+    async def _ensure_windows_node(self, node: str) -> str:
+        probe = await self._run_command([node, "--version"], timeout=30)
+        if probe.returncode == 0 and probe.stdout.strip() == f"v{_NODE_VERSION}":
+            runtime = Path(node)
+        else:
+            architecture = {"amd64": "x64", "x86_64": "x64", "arm64": "arm64"}.get(
+                platform.machine().lower()
+            )
+            if architecture is None:
+                raise RuntimeError("zcode: unsupported Windows Node architecture")
+            directory = f"node-v{_NODE_VERSION}-win-{architecture}"
+            cache = Path.home() / ".zcode_build/node"
+            runtime = cache / directory / "node.exe"
+            if not runtime.is_file():
+                await asyncio.to_thread(_download_windows_node, cache, directory)
+            probe = await self._run_command([str(runtime), "--version"], timeout=30)
+            if probe.returncode or probe.stdout.strip() != f"v{_NODE_VERSION}":
+                raise RuntimeError("zcode: private Windows Node version mismatch")
+        os.environ["PATH"] = str(runtime.parent) + os.pathsep + os.environ.get("PATH", "")
+        return str(runtime)
+
+    async def _run_command(self, argv: list[str], **kwargs) -> subprocess.CompletedProcess:
+        if self.executor.sandbox.is_linux:
+            return await run_command(argv, **kwargs)
+        if Path(argv[0]).suffix.lower() in {".js", ".cjs"}:
+            argv = [self._node_path, *argv]
+        timeout = kwargs.get("timeout", 300)
+        with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+            proc = subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                cwd=kwargs.get("cwd"),
+                env=kwargs.get("env"),
+            )
+            await self._wait_process(proc, timeout=timeout)
+            stdout_file.seek(0)
+            stderr_file.seek(0)
+            return subprocess.CompletedProcess(
+                argv,
+                proc.returncode,
+                stdout_file.read().decode("utf-8", errors="replace"),
+                stderr_file.read().decode("utf-8", errors="replace"),
+            )
+
+    async def _wait_process(self, proc: subprocess.Popen, *, timeout: float | None = None) -> int:
+        """Reap the CLI; Windows descendants remain in the sandbox supervisor's Job Object."""
+        if self.executor.sandbox.is_linux:
+            return await wait_process(proc, timeout=timeout, grace_s=_TERM_GRACE_S)
+        try:
+            async with asyncio.timeout(timeout):
+                while proc.poll() is None:
+                    await asyncio.sleep(0.05)
+                return proc.returncode
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=_TERM_GRACE_S)
+
     @staticmethod
-    def _build_builtin_config(cfg: ZCodeConfig | None = None) -> dict:
-        """Build fallback OpenAI-compatible model capabilities and option mappings."""
-        cfg = cfg or ZCodeConfig()
-        return {
-            "schemaVersion": 1,
-            "revision": 1,
-            "config": {
-                "providerConfigRules": {"templateRules": [], "providerRules": []},
-                "modelConfigRules": {
-                    "modelRules": [
-                        {
-                            "modelMatch": ".*",
-                            "config": {
-                                "enabled": True,
-                                "properties": {
-                                    "contextWindow": cfg.context_window,
-                                    "inputFormat": {
-                                        "supportsText": True,
-                                        "supportsImage": False,
-                                        "supportsVideo": False,
-                                        "supportsAudio": False,
-                                        "supportsPdf": False,
-                                    },
-                                    "outputFormat": {"supportsText": True},
-                                    "supportsToolCall": True,
-                                    "supportsJsonSchemaOutput": False,
-                                    "supportsNativeWebSearch": False,
-                                    "supportsMidConversationSystem": False,
-                                    "requiresMfjsToolSchema": False,
-                                },
-                                "optionSpecs": {
-                                    "maxOutputTokens": {"max": cfg.max_output_tokens},
-                                    "reasoningLevel": {
-                                        "values": ["disabled", "enabled"],
-                                        "map": "{}",
-                                    },
-                                },
-                            },
-                        },
-                    ],
-                    "modelApiRules": [
-                        {
-                            "modelMatch": ".*",
-                            "apiTypeMatch": "openai-chat-completions",
-                            "config": {
-                                "optionSpecs": {
-                                    "reasoningLevel": {
-                                        "map": json.dumps(cfg.reasoning_request),
-                                    },
-                                    "maxOutputTokens": {
-                                        "map": "{'max_completion_tokens': maxOutputTokens}",
-                                    },
-                                },
-                            },
-                        },
-                    ],
-                    "providerSiteRules": [],
-                    "templateModelRules": [],
-                    "builtinProviderModelRules": [],
-                },
+    def _build_builtin_config(cfg: ZCodeConfig, upstream_builtin: dict) -> dict:
+        """Preserve CLI-owned defaults and scope explicit overrides to this model."""
+        builtin = copy.deepcopy(upstream_builtin)
+        options = {
+            "reasoningLevel": {
+                "values": ["disabled", "enabled"],
+                "map": json.dumps(cfg.reasoning_request),
             },
         }
+        if cfg.max_output_tokens is not None:
+            options["maxOutputTokens"] = {
+                "max": cfg.max_output_tokens,
+                "map": "{'max_completion_tokens': maxOutputTokens}",
+            }
+        builtin["config"]["modelConfigRules"]["builtinProviderModelRules"].append(
+            {
+                "providerId": cfg.provider_id,
+                "modelId": cfg.model,
+                "config": {
+                    "properties": {"contextWindow": cfg.context_window},
+                    "optionSpecs": options,
+                },
+            }
+        )
+        return builtin
 
     @staticmethod
     def _build_personal_config(cfg: ZCodeConfig) -> dict:
-        """One custom provider -- see module docstring for schema source."""
+        """Register a custom provider and its default model selection."""
         return {
             "schemaVersion": 1,
             "config": {
@@ -354,6 +501,11 @@ class ZCodeDeployer(BaseAgentDeployer):
             str(wd),
         ]
         env = self._build_env(cfg)
+        if not self.executor.sandbox.is_linux:
+            prompt_path = wd / "prompt.txt"
+            prompt_path.write_text(prompt, encoding="utf-8")
+            env["ALE_ZCODE_PROMPT_FILE"] = str(prompt_path)
+            argv = [self._node_path, "-e", _WINDOWS_PROMPT_LOADER, str(self._cli_path), *argv[4:]]
 
         t0 = time.monotonic()
         with open(stdout_log, "wb") as fout, open(stderr_log, "wb") as ferr:
@@ -364,14 +516,14 @@ class ZCodeDeployer(BaseAgentDeployer):
                 stderr=ferr,
                 env=env,
                 cwd=str(wd),
-                start_new_session=True if hasattr(os, "setsid") else False,
+                start_new_session=self.executor.sandbox.is_linux,
             )
         pid_file.write_text(str(proc.pid), encoding="ascii")
         logger.info(
             "zcode: spawned pid=%s (model=%s base_url=%s)", proc.pid, cfg.model, cfg.base_url
         )
 
-        await wait_process(proc, grace_s=_TERM_GRACE_S)
+        await self._wait_process(proc)
 
         duration_s = time.monotonic() - t0
         exit_code = proc.returncode
@@ -397,6 +549,8 @@ class ZCodeDeployer(BaseAgentDeployer):
         env.update(self._provider_env)
         env["NO_COLOR"] = "1"
         env["HOME"] = getattr(self, "_home_dir", os.path.expanduser("~"))
+        if not self.executor.sandbox.is_linux:
+            env["USERPROFILE"] = env["HOME"]
         for k, v in cfg.extra_envs.items():
             env[k] = v
         if getattr(self, "_node_path", None):
@@ -639,6 +793,38 @@ class ZCodeDeployer(BaseAgentDeployer):
             message="",
             extra={"kind": top_type or "unknown", "raw": event},
         )
+
+
+def _download_windows_node(cache: Path, directory: str) -> None:
+    cache.mkdir(parents=True, exist_ok=True)
+    filename = f"{directory}.zip"
+    base_url = f"https://nodejs.org/dist/v{_NODE_VERSION}/"
+    with urllib.request.urlopen(base_url + "SHASUMS256.txt", timeout=60) as response:
+        checksums = dict(
+            line.split()[::-1] for line in response.read().decode("ascii").splitlines()
+        )
+    expected = checksums.get(filename)
+    if not expected:
+        raise RuntimeError("zcode: Windows Node archive has no official checksum")
+    with tempfile.TemporaryDirectory(prefix=".download-", dir=cache) as temporary:
+        staging = Path(temporary)
+        archive = staging / filename
+        with urllib.request.urlopen(base_url + filename, timeout=120) as response:
+            with archive.open("wb") as handle:
+                shutil.copyfileobj(response, handle)
+        with archive.open("rb") as handle:
+            actual = hashlib.file_digest(handle, "sha256").hexdigest()
+        if actual != expected:
+            raise RuntimeError("zcode: Windows Node archive checksum mismatch")
+        with zipfile.ZipFile(archive) as bundle:
+            bundle.extractall(staging)
+        extracted = staging / directory
+        if (
+            not (extracted / "node.exe").is_file()
+            or not (extracted / "node_modules/npm/bin/npm-cli.js").is_file()
+        ):
+            raise RuntimeError("zcode: Windows Node archive is missing Node or npm")
+        extracted.rename(cache / directory)
 
 
 def _diagnose_failure(stderr_log: Path, stdout_log: Path, exit_code: int | None) -> str:

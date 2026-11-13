@@ -22,7 +22,7 @@ harness: antigravity_cli
 # executor: sandbox          # only supported value (deployer default).
 
 # One of the display names printed by `agy models` (accepted verbatim by --model).
-model: Gemini 3.7 Flash (High)
+model: Gemini 3.8 Flash (High)
 
 config:
   # Bypass tool-permission prompts (required headless) -> --dangerously-skip-permissions.

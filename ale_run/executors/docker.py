@@ -9,8 +9,8 @@ Per-unit ``docker create --rm`` followed by ``docker start --attach``, with:
                                        import time (no copy needed)
 * ``--network host``                 — so the deployer can reach the
                                        sandbox VM's cua-server endpoint
-* ``--env-file <api_keys>``          — keeps api keys off the cmdline +
-                                       out of ``docker inspect``. Written
+* ``--env-file <api_keys>``          — keeps api keys off the cmdline, but
+                                       visible in ``docker inspect``. Written
                                        to a private tempdir OUTSIDE the
                                        bind mount so it never lands in the
                                        gathered host log dir; removed after
@@ -63,7 +63,7 @@ logger = logging.getLogger(__name__)
 _DEFAULT_IMAGE_TAG = "ale/native-base:0.1.0"
 
 # How much wall-clock slack we give the container over the agent budget
-# (covers ``uv sync`` / dep install + container teardown).
+# (covers container transport and teardown; installation uses the agent budget).
 _DOCKER_SLACK_S = 180.0
 
 
@@ -118,6 +118,11 @@ class DockerExecutor(BaseExecutor):
     ) -> "AgentRunResult":
         from ..base_interface import AgentRunResult
 
+        host_work = Path(self.work_dir)
+        host_work.mkdir(parents=True, exist_ok=True)
+        (host_work / "_cli_identity.json").unlink(missing_ok=True)
+        (host_work / "_agent_started").unlink(missing_ok=True)
+
         if not _docker_available():
             return AgentRunResult(
                 status="failed",
@@ -129,9 +134,6 @@ class DockerExecutor(BaseExecutor):
                 error=f"DockerExecutor: image {self.image!r} not present "
                       f"on host. Pull or build it first.",
             )
-
-        host_work = Path(self.work_dir)
-        host_work.mkdir(parents=True, exist_ok=True)
 
         # 1. Write spec.json into the bind mount.
         #    Secrets (api keys etc.) are deliberately KEPT OUT of the spec —
@@ -164,7 +166,7 @@ class DockerExecutor(BaseExecutor):
             {**dict(self.env or {}), **config_secrets},
         )
 
-        # 2. Write env-file (keeps api keys off cmdline + docker inspect).
+        # 2. Write env-file (keeps api keys off cmdline, not docker inspect).
         #    Lives in a private tempdir OUTSIDE the bind-mounted work_dir so
         #    it is never part of the host log dir; removed after the run.
         env_lines = []

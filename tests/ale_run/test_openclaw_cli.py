@@ -1,9 +1,209 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+import yaml
+
 from ale_run.agents.openclaw_cli import OpenClawCliConfig, OpenClawCliDeployer
+
+
+async def test_gateway_health_allows_slow_cli_startup(tmp_path, monkeypatch) -> None:
+    from ale_run.agents.qwen_code.runtime import stop_process
+
+    deployer = OpenClawCliDeployer(SimpleNamespace(config=OpenClawCliConfig()))
+    deployer._episode_state_dir = tmp_path
+    deployer._gateway_token = "test-token"
+    (tmp_path / "openclaw.json").write_text(json.dumps({"gateway": {}}))
+    script = tmp_path / "fake_openclaw.py"
+    script.write_text(
+        "import sys, time\n"
+        "time.sleep(7 if sys.argv[1:3] == ['gateway', 'call'] else 300)\n"
+    )
+    monkeypatch.setattr(deployer, "_launch_prefix", lambda: [sys.executable, str(script)])
+
+    process, job = await deployer._start_gateway({}, tmp_path, None)
+    try:
+        assert process.returncode is None
+    finally:
+        await stop_process(process, job, 0.1)
+
+
+async def test_gateway_health_retries_timeout_with_extended_budget(tmp_path, monkeypatch) -> None:
+    from ale_run.agents.qwen_code import runtime
+
+    deployer = OpenClawCliDeployer(SimpleNamespace(config=OpenClawCliConfig()))
+    deployer._episode_state_dir = tmp_path
+    deployer._gateway_token = "test-token"
+    (tmp_path / "openclaw.json").write_text(json.dumps({"gateway": {}}))
+    gateway = SimpleNamespace(pid=123, returncode=None)
+    calls = []
+
+    async def start(*args, **kwargs):
+        assert args[:3] == ("openclaw", "gateway", "run")
+        return gateway
+
+    async def check(argv, *, env, timeout):
+        calls.append((argv, timeout))
+        if len(calls) == 1:
+            raise asyncio.TimeoutError
+        return SimpleNamespace(returncode=0)
+
+    async def stop(*args):
+        raise AssertionError("healthy gateway must not be stopped")
+
+    monkeypatch.setattr(deployer, "_launch_prefix", lambda: ["openclaw"])
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", start)
+    monkeypatch.setattr(runtime, "command", check)
+    monkeypatch.setattr(runtime, "stop_process", stop)
+
+    process, job = await deployer._start_gateway({}, tmp_path, None)
+
+    assert process is gateway and job is None
+    assert len(calls) == 2
+    assert all(timeout == 30 for _, timeout in calls)
+    assert all(argv[-2:] == ["--timeout", "10000"] for argv, _ in calls)
+
+
+async def test_gateway_unhealthy_after_startup_budget_is_stopped(tmp_path, monkeypatch) -> None:
+    from ale_run.agents.openclaw_cli import deployer as deployer_module
+    from ale_run.agents.qwen_code import runtime
+
+    deployer = OpenClawCliDeployer(SimpleNamespace(config=OpenClawCliConfig()))
+    deployer._episode_state_dir = tmp_path
+    deployer._gateway_token = "test-token"
+    (tmp_path / "openclaw.json").write_text(json.dumps({"gateway": {}}))
+    gateway = SimpleNamespace(pid=123, returncode=None)
+    clock = iter([0, 1, 181])
+    stopped = []
+
+    async def start(*args, **kwargs):
+        return gateway
+
+    async def check(argv, *, env, timeout):
+        return SimpleNamespace(returncode=1)
+
+    async def stop(process, job, grace):
+        stopped.append(process)
+
+    monkeypatch.setattr(deployer, "_launch_prefix", lambda: ["openclaw"])
+    monkeypatch.setattr(deployer_module, "time", SimpleNamespace(monotonic=lambda: next(clock)))
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", start)
+    monkeypatch.setattr(runtime, "command", check)
+    monkeypatch.setattr(runtime, "stop_process", stop)
+
+    with pytest.raises(RuntimeError, match="did not become ready within 180 seconds"):
+        await deployer._start_gateway({}, tmp_path, None)
+    assert stopped == [gateway]
+
+
+def test_default_preset_uses_official_cli_and_local_desktop_tools() -> None:
+    preset = yaml.safe_load(Path("configs/agents/openclaw_cli.yaml").read_text())
+    config = preset["config"]
+    assert config["cli_version"] == OpenClawCliConfig().cli_version
+    assert not config["tarball_path"] and not config["tarball_url"]
+    assert not config["tools_deny"] and not OpenClawCliConfig().tools_deny
+    assert not config["plugins_allow"] and not OpenClawCliConfig().plugins_allow
+
+
+def test_episode_state_isolated_from_existing_openclaw_config(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("OPENCLAW_CONFIG_PATH", "unrelated-config.json")
+    config = OpenClawCliConfig()
+    executor = SimpleNamespace(
+        config=config,
+        env={"OPENROUTER_API_KEY": "episode-key"},
+        cua_bridge_url=lambda: "http://127.0.0.1:5000",
+    )
+    deployer = OpenClawCliDeployer(executor)
+    deployer._episode_state_dir = tmp_path / "episode-state"
+    deployer._write_config(config)
+
+    assert not (tmp_path / ".openclaw").exists()
+    generated = json.loads((deployer._state_dir / "openclaw.json").read_text())
+    assert "deny" not in generated["tools"]
+    assert "toolSearch" not in generated["tools"]
+    assert "allow" not in generated["plugins"]
+    assert generated["agents"]["defaults"]["modelPolicy"] == {"allow": []}
+    env = deployer._build_env(config, deployer._state_dir / ".env")
+    assert env["OPENCLAW_STATE_DIR"] == str(deployer._state_dir)
+    assert "OPENCLAW_CONFIG_PATH" not in env
+
+
+def test_primary_model_catalog_metadata(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = OpenClawCliConfig(
+        model="deepseek/deepseek-v4.1-flash-1017",
+        provider="openrouter",
+        base_url="https://openrouter.ai/api/v1",
+        model_input_types=("text", "image"),
+        model_context_window=1_048_576,
+        model_max_tokens=393_216,
+        model_reasoning=True,
+        vision_model=None,
+    )
+    executor = SimpleNamespace(
+        config=cfg,
+        env={"OPENROUTER_API_KEY": "test-key"},
+        cua_bridge_url=lambda: "http://127.0.0.1:5000",
+    )
+    OpenClawCliDeployer(executor)._write_config(cfg)
+    generated = json.loads((tmp_path / ".openclaw" / "openclaw.json").read_text())
+    model = generated["models"]["providers"]["openrouter"]["models"][0]
+    assert model["input"] == ["text", "image"]
+    assert model["contextWindow"] == model["contextTokens"] == 1_048_576
+    assert model["maxTokens"] == 393_216
+    assert model["reasoning"] is True
+
+
+def test_llm_idle_timeout_uses_provider_request_timeout(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = OpenClawCliConfig(
+        model="qwen3.8-max",
+        provider="custom",
+        provider_id="dashscope",
+        api_key_env="DASHSCOPE_API_KEY",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        vision_model="qwen3.8-max",
+        llm_idle_timeout_s=300,
+    )
+    executor = SimpleNamespace(
+        config=cfg,
+        env={"DASHSCOPE_API_KEY": "test-key"},
+        cua_bridge_url=lambda: "http://127.0.0.1:5000",
+    )
+    OpenClawCliDeployer(executor)._write_config(cfg)
+    generated = json.loads((tmp_path / ".openclaw" / "openclaw.json").read_text())
+    assert generated["models"]["providers"]["dashscope"]["timeoutSeconds"] == 300
+
+
+@pytest.mark.parametrize("timeout", [0, -1, True, 1.5])
+def test_llm_idle_timeout_rejects_invalid_values(tmp_path, monkeypatch, timeout) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = OpenClawCliConfig(base_url="https://example.com/v1", llm_idle_timeout_s=timeout)
+    executor = SimpleNamespace(
+        config=cfg,
+        env={"OPENROUTER_API_KEY": "test-key"},
+        cua_bridge_url=lambda: "http://127.0.0.1:5000",
+    )
+    with pytest.raises(ValueError, match="llm_idle_timeout_s"):
+        OpenClawCliDeployer(executor)._write_config(cfg)
+
+
+def test_llm_idle_timeout_requires_base_url(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = OpenClawCliConfig(llm_idle_timeout_s=300)
+    executor = SimpleNamespace(
+        config=cfg,
+        env={"OPENROUTER_API_KEY": "test-key"},
+        cua_bridge_url=lambda: "http://127.0.0.1:5000",
+    )
+    with pytest.raises(ValueError, match="llm_idle_timeout_s requires base_url"):
+        OpenClawCliDeployer(executor)._write_config(cfg)
 
 
 def test_write_config_supports_zai_primary_and_direct_openai_vision(
@@ -44,15 +244,12 @@ def test_write_config_supports_zai_primary_and_direct_openai_vision(
     defaults = openclaw_config["agents"]["defaults"]
     assert defaults["model"]["primary"] == "zai/glm-5.2"
     assert defaults["imageModel"]["primary"] == "openai/gpt-5.4"
-    assert defaults["llm"]["idleTimeoutSeconds"] == 180
+    assert "llm" not in defaults
     assert defaults["models"]["zai/glm-5.2"]["params"] == cfg.model_params
+    assert defaults["modelPolicy"] == {"allow": []}
     assert defaults["models"]["openai/gpt-5.4"] == {}
-    assert openclaw_config["tools"]["media"]["image"]["models"] == [
-        {"provider": "openai", "model": "gpt-5.4"}
-    ]
-    assert {"cua", "zai", "openai"} <= set(
-        openclaw_config["plugins"]["allow"]
-    )
+    assert "media" not in openclaw_config["tools"]
+    assert "allow" not in openclaw_config["plugins"]
     assert openclaw_config["models"]["providers"] == {
         "zai": {
             "baseUrl": "https://open.bigmodel.cn/api/paas/v4",
@@ -129,9 +326,7 @@ def test_write_config_supports_custom_primary_and_direct_openai_vision(
     assert defaults["models"]["azure-code/rc6-for-vlm-team"]["params"] == {
         "temperature": 1.0,
     }
-    assert openclaw_config["tools"]["media"]["image"]["models"] == [
-        {"provider": "openai", "model": "gpt-5.4"},
-    ]
+    assert "media" not in openclaw_config["tools"]
     assert "openai" in openclaw_config["plugins"]["allow"]
     assert "azure-code" not in openclaw_config["plugins"]["allow"]
     assert openclaw_config["models"]["providers"] == {
@@ -206,9 +401,7 @@ def test_write_config_supports_custom_native_vision_model(
     defaults = openclaw_config["agents"]["defaults"]
     assert defaults["model"]["primary"] == "moonshot/kimi-k2.7-code"
     assert defaults["imageModel"]["primary"] == "moonshot/kimi-k2.7-code"
-    assert openclaw_config["tools"]["media"]["image"]["models"] == [
-        {"provider": "moonshot", "model": "kimi-k2.7-code"},
-    ]
+    assert "media" not in openclaw_config["tools"]
     assert openclaw_config["models"]["providers"] == {
         "moonshot": {
             "baseUrl": "https://api.moonshot.ai/v1",

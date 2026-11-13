@@ -56,6 +56,33 @@
       click. It is the natural fit for harnesses that are already command-line
       tools, like Claude Code or Codex.
     </p>
+    <p>
+      ZCode supports Linux and Windows sandboxes using a pinned CLI source
+      revision and private provider configuration. Its
+      <code>max_output_tokens</code> setting defaults to <code>null</code>,
+      preserving the CLI's own model limits and request mapping. Set it only
+      for an explicit output-token override. Linux npm prefix setup allows
+      60 seconds and retries once on timeout; other setup errors fail immediately.
+    </p>
+
+    <p>
+      <a href="https://github.com/rdi-berkeley/agents-last-exam/tree/main/ale_run/agents/muse_code">Muse Code</a>
+      runs its pinned official CLI natively on Linux and Windows. Select
+      <code>configs/agents/muse_code.yaml</code> and set <code>META_API_KEY</code>.
+      It uses the same required CUA GUI bridge and pixel coordinates as the
+      Codex/Claude presets, with unattended execution and native session logs
+      for trajectories, screenshots, API usage, and tool timing.
+    </p>
+
+    <p>
+      <a href="https://github.com/rdi-berkeley/agents-last-exam/tree/main/ale_run/agents/qwen_code">Qwen Code</a>
+      runs its pinned official CLI on Linux and native Windows with the required
+      CUA GUI bridge. Use <code>configs/agents/qwen_code.yaml</code> with
+      <code>QWEN_API_KEY</code>, or <code>configs/agents/qwen_code_openai.yaml</code>
+      with <code>OPENAI_API_KEY</code> to use OpenAI's Responses API.
+      Its README documents model limits, reasoning, GUI coordinates, native
+      telemetry, screenshot recovery, and tool-record completeness.
+    </p>
 
     <h3>Out-of-sandbox</h3>
     <p>

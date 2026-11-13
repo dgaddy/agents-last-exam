@@ -37,12 +37,17 @@ from typing import Any, AsyncGenerator, Callable, Dict, List, Optional
 from agent.agent import ComputerAgent, assert_callable_with, get_json, get_output_call_ids
 from agent.computers.base import AsyncComputerHandler
 from agent.computers.cua import cuaComputerHandler
-from .model.model_config import ResolvedModel, call_with_retry_budget
+from .model.model_config import (
+    ResolvedModel,
+    call_with_retry_budget,
+    merge_helper_generation_kwargs,
+    model_generation_kwargs,
+    resolve_model,
+)
 from agent.responses import make_tool_error_item, replace_failed_computer_calls_with_function_calls
 from agent.tools.base import BaseTool
 from agent.types import ToolError
 from core.telemetry import is_telemetry_enabled, record_event
-from litellm.responses.utils import Usage
 
 
 # Map of computer-action name → the param keys the action accepts.
@@ -181,6 +186,9 @@ class OpenClawComputerAgent(ComputerAgent):
         self.thinking_config = thinking_config
         self.resolved_model = resolved_model
         self.summary_runtime = summary_runtime
+        self._helper_api_key: Optional[str] = None
+        self._helper_api_base: Optional[str] = None
+        self._helper_generation_kwargs: Dict[str, Any] = {}
         self._registry = registry
         # Stable bootstrap files re-injected post-compaction so the agent
         # re-anchors on workspace rules after the lossy summary. Mirrors
@@ -199,6 +207,7 @@ class OpenClawComputerAgent(ComputerAgent):
         stream: bool = False,
         api_key: Optional[str] = None,
         api_base: Optional[str] = None,
+        max_turns: Optional[int] = None,
         **additional_generation_kwargs,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Override ComputerAgent.run() with mutable message list + compaction.
@@ -212,9 +221,9 @@ class OpenClawComputerAgent(ComputerAgent):
           preprocessed = _on_llm_start()  <- updates current_tokens
           _maybe_flush_memory()            <- PRE-API: uses fresh current_tokens
           predict_step()                   <- API call
-          yield result
           _log_step_to_transcript()        <- transcript logging
           _handle_item()
+          yield result
           compaction check
         """
         # MUTABLE items list — the key difference from parent run()
@@ -222,6 +231,8 @@ class OpenClawComputerAgent(ComputerAgent):
             messages, stream, api_key, api_base, additional_generation_kwargs
         )
         new_items: List[Dict[str, Any]] = []
+        turns = 0
+        loop_kwargs: Dict[str, Any] = run_kwargs
 
         # Loop until the model emits an explicit DONE signal (or the outer
         # consumer breaks out via max_steps). The upstream CUA exit condition
@@ -230,135 +241,140 @@ class OpenClawComputerAgent(ComputerAgent):
         # emitted bare text (e.g., the [!silent] memory-flush sentinel after
         # a contaminated compaction). OpenClaw semantics want "stop on DONE,"
         # not "stop when tool calls stop."
-        while True:
-            should_continue = await self._on_run_continue(run_kwargs, items, new_items)
-            if not should_continue:
-                break
+        run_status = "failed"
+        try:
+            while True:
+                should_continue = await self._on_run_continue(run_kwargs, items, new_items)
+                if not should_continue:
+                    break
 
-            combined = items + new_items
-            combined = replace_failed_computer_calls_with_function_calls(combined)
-            combined = self._sanitize_runtime_messages(combined)
-            preprocessed = await self._on_llm_start(combined)
+                combined = items + new_items
+                combined = replace_failed_computer_calls_with_function_calls(combined)
+                combined = self._sanitize_runtime_messages(combined)
+                preprocessed = await self._on_llm_start(combined)
 
-            # PRE-API memory flush — runs after _on_llm_start updates
-            # current_tokens, before predict_step. Matches OpenClaw's single call
-            # site: runMemoryFlushIfNeeded before runAgentTurnWithFallback.
-            await self._maybe_flush_memory()
+                # PRE-API memory flush — runs after _on_llm_start updates
+                # current_tokens, before predict_step. Matches OpenClaw's single call
+                # site: runMemoryFlushIfNeeded before runAgentTurnWithFallback.
+                await self._maybe_flush_memory()
 
-            loop_kwargs = {
-                "messages": preprocessed,
-                "model": self.model,
-                "tools": self.tool_schemas,
-                "stream": False,
-                "computer_handler": self.computer_handler,
-                "max_retries": self.max_retries,
-                "use_prompt_caching": self.use_prompt_caching,
-                **merged_kwargs,
-            }
+                loop_kwargs = {
+                    "messages": preprocessed,
+                    "model": self.model,
+                    "tools": self.tool_schemas,
+                    "stream": False,
+                    "computer_handler": self.computer_handler,
+                    "max_retries": self.max_retries,
+                    "use_prompt_caching": self.use_prompt_caching,
+                    **merged_kwargs,
+                }
 
-            # === REACTIVE OVERFLOW & 24H TRANSIENT RETRY: around predict_step ===
-            try:
-                result = await call_with_retry_budget(
-                    lambda: self.agent_loop.predict_step(
-                        **loop_kwargs,
-                        _on_api_start=self._on_api_start,
-                        _on_api_end=self._on_api_end,
-                        _on_usage=self._on_usage,
-                        _on_screenshot=self._on_screenshot,
-                    ),
-                    label=f"agent_loop.predict_step({self.model})",
+                # === REACTIVE OVERFLOW & 24H TRANSIENT RETRY: around predict_step ===
+                try:
+                    result = await call_with_retry_budget(
+                        lambda: self.agent_loop.predict_step(
+                            **loop_kwargs,
+                            _on_api_start=self._on_api_start,
+                            _on_api_end=self._on_api_end,
+                            _on_usage=self._on_usage,
+                            _on_screenshot=self._on_screenshot,
+                        ),
+                        label=f"agent_loop.predict_step({self.model})",
+                    )
+                except Exception as e:
+                    if (
+                        is_context_overflow_error(str(e))
+                        and self._compaction_count < self.max_compactions
+                    ):
+                        self.overflow_cb.force_compaction()
+                        print(f"[ContextOverflow] API rejected — reactive compaction: {e}")
+                        await self._compact_in_place(items, new_items)
+                        items = items + new_items
+                        new_items = []
+                        continue
+                    raise
+
+                result = get_json(result)
+                usage = result.get("usage") or {}
+                self.session_mgr.update_step_count(turns + 1)
+                self.session_mgr.update_tokens(
+                    usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0,
+                    usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0,
                 )
-            except Exception as e:
+                result["output"] = await self._on_llm_end(result.get("output", []))
+                await self._on_responses(loop_kwargs, result)
+
+                # Sanitize truncated tool-call payloads before anything else
+                # touches result["output"]. Mid-stream provider drops (sonnet-4.6
+                # via OpenRouter, observed on `write` calls) leave a function_call
+                # block with a half-finished JSON arguments string. If we let it
+                # through, the bad string ends up persisted in transcript and in
+                # the in-memory message list — fine for normal per-turn API sends,
+                # but compaction's history rebuild re-parses every function_call's
+                # arguments and crashes the run. Rewriting in place + appending
+                # the synthetic tool_error here keeps the data self-consistent so
+                # any downstream re-serializer is safe.
+                self._sanitize_truncated_function_calls(result.get("output", []))
+
+                # Log model-emitted assistant content/tool calls to transcript.
+                self._log_step_to_transcript(result)
+
+                # Log bare assistant text to stdout (tool calls are already
+                # logged by ToolLoggingCallback; text-only turns had no console
+                # visibility, which masked e.g. the DONE signal).
+                self._log_assistant_text(result.get("output", []))
+
+                new_items += result.get("output", [])
+                output_call_ids = get_output_call_ids(result.get("output", []))
+
+                for item in result.get("output", []):
+                    partial_items = await self._handle_item(
+                        item, self.computer_handler, ignore_call_ids=output_call_ids
+                    )
+                    new_items += partial_items
+                    if partial_items:
+                        self._log_partial_items_to_transcript(partial_items)
+                turns += 1
+                if has_done_signal(result.get("output", [])):
+                    run_status = "completed"
+                yield result
+
+                # === SUBAGENT COMPLETION DRAIN ===
+                # Drain before the compaction check so any new user messages from
+                # completed general subagents count toward this iteration's token
+                # pressure.
+                self._drain_completions(new_items)
+                # === POST-DELEGATION SCREENSHOT DRAIN ===
+                # Runs after completions so the GUI-delegation screenshot is the
+                # freshest user turn heading into the next predict_step.
+                self._drain_post_delegation(new_items)
+
+                if has_done_signal(result.get("output", [])):
+                    break
+                if max_turns is not None and turns >= max_turns:
+                    break
+
+                # === PROACTIVE COMPACTION INJECTION POINT ===
                 if (
-                    is_context_overflow_error(str(e))
+                    self.overflow_cb.needs_compaction
                     and self._compaction_count < self.max_compactions
                 ):
-                    self.overflow_cb.force_compaction()
-                    print(f"[ContextOverflow] API rejected — reactive compaction: {e}")
+                    print("[Compaction] Proactive trigger — compacting in-place")
                     await self._compact_in_place(items, new_items)
                     items = items + new_items
                     new_items = []
                     continue
-                raise
 
-            result = get_json(result)
-            result["output"] = await self._on_llm_end(result.get("output", []))
-            await self._on_responses(loop_kwargs, result)
+                # === DONE-BASED TERMINATION ===
+                # Replaces the upstream "last item is assistant" exit. Only an
+                # explicit DONE in the assistant output ends the generator from
+                # inside; max_steps in the outer consumer is the other ceiling.
+                # === BARE-TEXT TURN NUDGE (bug-2-nudge) ===
+                self._maybe_nudge_bare_text(result, new_items)
 
-            # Sanitize truncated tool-call payloads before anything else
-            # touches result["output"]. Mid-stream provider drops (sonnet-4.6
-            # via OpenRouter, observed on `write` calls) leave a function_call
-            # block with a half-finished JSON arguments string. If we let it
-            # through, the bad string ends up persisted in transcript and in
-            # the in-memory message list — fine for normal per-turn API sends,
-            # but compaction's history rebuild re-parses every function_call's
-            # arguments and crashes the run. Rewriting in place + appending
-            # the synthetic tool_error here keeps the data self-consistent so
-            # any downstream re-serializer is safe.
-            self._sanitize_truncated_function_calls(result.get("output", []))
-
-            yield result
-
-            # Log model-emitted assistant content/tool calls to transcript.
-            self._log_step_to_transcript(result)
-
-            # Log bare assistant text to stdout (tool calls are already
-            # logged by ToolLoggingCallback; text-only turns had no console
-            # visibility, which masked e.g. the DONE signal).
-            self._log_assistant_text(result.get("output", []))
-
-            new_items += result.get("output", [])
-            output_call_ids = get_output_call_ids(result.get("output", []))
-
-            for item in result.get("output", []):
-                partial_items = await self._handle_item(
-                    item, self.computer_handler, ignore_call_ids=output_call_ids
-                )
-                new_items += partial_items
-                if partial_items:
-                    self._log_partial_items_to_transcript(partial_items)
-                if partial_items:
-                    yield {
-                        "output": partial_items,
-                        "usage": Usage(
-                            prompt_tokens=0,
-                            completion_tokens=0,
-                            total_tokens=0,
-                        ).model_dump(),
-                    }
-
-            # === SUBAGENT COMPLETION DRAIN ===
-            # Drain before the compaction check so any new user messages from
-            # completed general subagents count toward this iteration's token
-            # pressure.
-            self._drain_completions(new_items)
-            # === POST-DELEGATION SCREENSHOT DRAIN ===
-            # Runs after completions so the GUI-delegation screenshot is the
-            # freshest user turn heading into the next predict_step.
-            self._drain_post_delegation(new_items)
-
-            # === PROACTIVE COMPACTION INJECTION POINT ===
-            if (
-                self.overflow_cb.needs_compaction
-                and self._compaction_count < self.max_compactions
-            ):
-                print("[Compaction] Proactive trigger — compacting in-place")
-                await self._compact_in_place(items, new_items)
-                items = items + new_items
-                new_items = []
-                continue
-
-            # === DONE-BASED TERMINATION ===
-            # Replaces the upstream "last item is assistant" exit. Only an
-            # explicit DONE in the assistant output ends the generator from
-            # inside; max_steps in the outer consumer is the other ceiling.
-            if has_done_signal(result.get("output", [])):
-                break
-
-            # === BARE-TEXT TURN NUDGE (bug-2-nudge) ===
-            self._maybe_nudge_bare_text(result, new_items)
-
-        await self._on_run_end(loop_kwargs, items, new_items)
+        finally:
+            loop_kwargs = {**loop_kwargs, "ale_claw_status": run_status}
+            await self._on_run_end(loop_kwargs, items, new_items)
 
     async def _run_setup(
         self,
@@ -391,6 +407,28 @@ class OpenClawComputerAgent(ComputerAgent):
             merged_kwargs["api_key"] = api_key if api_key is not None else self.api_key
         if (api_base is not None) or (self.api_base is not None):
             merged_kwargs["api_base"] = api_base if api_base is not None else self.api_base
+        self._helper_api_key = merged_kwargs.get("api_key")
+        self._helper_api_base = merged_kwargs.get("api_base")
+        primary_model = merged_kwargs.get("model", self.model)
+        helper_model = (
+            self.summary_runtime.model if self.summary_runtime else self.summary_model
+        )
+        self._helper_generation_kwargs = model_generation_kwargs(
+            primary_model, helper_model, additional_generation_kwargs
+        )
+        primary_provider = (
+            primary_model.split("/", 1)[0] if "/" in primary_model
+            else resolve_model(primary_model).provider
+        )
+        helper_provider = (
+            helper_model.split("/", 1)[0] if "/" in helper_model
+            else resolve_model(helper_model).provider
+        )
+        if primary_provider != helper_provider or (
+            primary_provider == "unknown" and primary_model != helper_model
+        ):
+            self._helper_api_key = None
+            self._helper_api_base = None
 
         items = self._process_input(messages)
 
@@ -492,15 +530,19 @@ class OpenClawComputerAgent(ComputerAgent):
             flush_prompt=MEMORY_FLUSH_PROMPT,
             flush_system_prompt=MEMORY_FLUSH_SYSTEM_PROMPT,
             silent_token=SILENT_REPLY_TOKEN,
-            thinking_params=(
+            thinking_params=merge_helper_generation_kwargs(
+                getattr(self, "_helper_generation_kwargs", {}),
                 self.thinking_config.flush_params(
                     self.summary_model,
                     runtime=self.summary_runtime,
                 )
                 if self.thinking_config is not None
-                else None
+                else {},
+                override_thinking=(self.thinking_config.flush_level_overridden if self.thinking_config else False),
             ),
             summary_runtime=self.summary_runtime,
+            api_key=self._helper_api_key,
+            api_base=self._helper_api_base,
         )
 
     def _drain_completions(self, new_items: List[Dict[str, Any]]) -> None:
@@ -666,6 +708,8 @@ class OpenClawComputerAgent(ComputerAgent):
         are rewritten into LiteLLM's ``image_url`` vision-input shape.
         """
         if item.get("type") != "function_call":
+            if item.get("type") == "computer_call" and self._gui_subagent_active():
+                return [make_tool_error_item("A GUI subagent is using the desktop", item.get("call_id"))]
             result = await super()._handle_item(item, computer, ignore_call_ids)
             return _rewrite_input_image_to_image_url(result)
 
@@ -706,6 +750,8 @@ class OpenClawComputerAgent(ComputerAgent):
         await self._on_function_call_start(item)
 
         if item.get("name") == "computer" and computer:
+            if self._gui_subagent_active():
+                raise ToolError("A GUI subagent is using the desktop")
             result = await self._dispatch_computer_function_call(item, computer)
             await self._on_function_call_end(item, result)
             return result
@@ -717,7 +763,13 @@ class OpenClawComputerAgent(ComputerAgent):
 
         args = json.loads(item.get("arguments"))
         if isinstance(function, BaseTool):
-            tool_result: Any = function.call(args)
+            from .subagent.subagent_tools import DelegateGeneralTool, DelegateGUITool, SubagentsTool
+            if isinstance(function, (DelegateGeneralTool, DelegateGUITool, SubagentsTool)):
+                tool_result: Any = function.call(args)
+            elif callable(getattr(function, "acall", None)):
+                tool_result = await function.acall(args)
+            else:
+                tool_result = await asyncio.to_thread(function.call, args)
         else:
             assert_callable_with(function, **args)
             if inspect.iscoroutinefunction(function):
@@ -763,6 +815,14 @@ class OpenClawComputerAgent(ComputerAgent):
         await self._on_function_call_end(item, wrapped)
         return wrapped
 
+    def _gui_subagent_active(self) -> bool:
+        from .subagent.subagent_registry import SubagentStatus, SubagentType
+
+        return bool(self._registry and any(
+            run.type == SubagentType.GUI and run.status in (SubagentStatus.PENDING, SubagentStatus.RUNNING)
+            for run in self._registry.list_runs()
+        ))
+
     async def _dispatch_computer_function_call(
         self,
         item: Dict[str, Any],
@@ -788,6 +848,9 @@ class OpenClawComputerAgent(ComputerAgent):
             if k in relevant_params or action_type not in _COMPUTER_ACTION_PARAMS:
                 if v is not None and v != "" and v != []:
                     action_args[k] = v
+
+        if action_type == "wait" and "seconds" in action_args:
+            action_args.setdefault("ms", int(action_args.pop("seconds") * 1000))
 
         computer_method = getattr(computer, action_type, None)
         if not computer_method:
@@ -819,10 +882,18 @@ class OpenClawComputerAgent(ComputerAgent):
 
         if self.screenshot_delay and self.screenshot_delay > 0:
             await asyncio.sleep(self.screenshot_delay)
-        screenshot_base64 = await computer.screenshot()
+        screenshot_base64 = (
+            action_result if action_type == "screenshot" else await computer.screenshot()
+        )
         # resize/transcode if the screenshot exceeds OpenClaw's
         # 5 MB / 1200 px / 25 MP limits before it enters the transcript.
         sanitized_b64, sanitized_mime = _maybe_sanitize_screenshot(screenshot_base64)
+        if hasattr(computer, "set_screenshot_dimensions"):
+            import base64
+            import io
+            from PIL import Image
+            with Image.open(io.BytesIO(base64.b64decode(sanitized_b64))) as screenshot:
+                computer.set_screenshot_dimensions(*screenshot.size)
         await self._on_screenshot(sanitized_b64, "screenshot_after")
 
         # ``action="screenshot"`` returns raw base64 — short-circuit so we
@@ -902,7 +973,7 @@ class OpenClawComputerAgent(ComputerAgent):
                 "input": step_input,
                 "output": step_output,
                 "total": step_input + step_output,
-                "cost": result["usage"].get("response_cost", 0),
+                "cost": result["usage"].get("response_cost", result["usage"].get("cost")),
             }
             self.session_mgr.append_message(
                 "assistant",
@@ -979,15 +1050,19 @@ class OpenClawComputerAgent(ComputerAgent):
             self.summary_model,
             self.overflow_cb.context_window,
             instructions_tokens=len(self.instructions or "") // 4,
-            thinking_params=(
+            thinking_params=merge_helper_generation_kwargs(
+                getattr(self, "_helper_generation_kwargs", {}),
                 self.thinking_config.compaction_params(
                     self.summary_model,
                     runtime=self.summary_runtime,
                 )
                 if self.thinking_config is not None
-                else None
+                else {},
+                override_thinking=(self.thinking_config.compaction_level_overridden if self.thinking_config else False),
             ),
             summary_runtime=self.summary_runtime,
+            api_key=self._helper_api_key,
+            api_base=self._helper_api_base,
         )
 
         # Persist compaction entry with firstKeptEntryId

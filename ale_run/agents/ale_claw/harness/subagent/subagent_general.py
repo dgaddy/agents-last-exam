@@ -61,7 +61,13 @@ async def run_general_subagent(
     memory_store: Any | None = None,
     max_steps: int = DEFAULT_MAX_STEPS,
     thinking_params: dict[str, Any] | None = None,
+    summary_thinking_params: dict[str, Any] | None = None,
+    summary_thinking_overridden: bool = False,
+    generation_kwargs: dict[str, Any] | None = None,
+    summary_generation_kwargs: dict[str, Any] | None = None,
     initial_screenshot_paths: list[str] | None = None,
+    credentials: dict[str, str] | None = None,
+    summary_credentials: dict[str, str] | None = None,
 ) -> None:
     """Run a general subagent as a persistent session.
 
@@ -103,7 +109,13 @@ async def run_general_subagent(
             memory_store=memory_store,
             max_steps=max_steps,
             thinking_params=thinking_params,
+            summary_thinking_params=summary_thinking_params,
+            summary_thinking_overridden=summary_thinking_overridden,
+            generation_kwargs=generation_kwargs,
+            summary_generation_kwargs=summary_generation_kwargs,
             initial_screenshot_paths=initial_screenshot_paths,
+            credentials=credentials,
+            summary_credentials=summary_credentials,
         )
         registry.attach_inbox(run_id, session.inbox)
         with usage_scope(role="subagent"):
@@ -128,7 +140,7 @@ async def run_general_subagent(
         # Mark the registry KILLED but re-raise so the asyncio.Task surfaces
         # as cancelled to the supervising tool.
         logger.info("[Subagent] General subagent %s cancelled", run_id)
-        registry.kill(run_id)
+        registry.kill(run_id, session.usage if session is not None else None)
         raise
     except Exception as e:
         logger.warning("[Subagent] General subagent %s failed: %s", run_id, e)

@@ -68,10 +68,18 @@ lists all 30 retirements. To preserve the original requirements, use the
 ```bash
 git clone git@github.com:rdi-berkeley/agents-last-exam.git
 cd agents-last-exam
-uv sync --all-packages
+bash env/install_host_deps.sh
+uv sync --all-packages --locked
+bash env/verify_host_env.sh
 cp -n secret/.env.example secret/.env
 cp example_exp.yaml my_experiment.yaml
 ```
+
+The host installer supports Ubuntu 22.04/24.04/26.04 and Debian 12/13.
+The verifier checks all 122 active task entry points, evaluator imports,
+Python versions against the checked-in `uv.lock`, and native tools including
+FFmpeg/ffprobe. See [host setup](env/README.md#host-evaluation-environment) for
+requirements and validation scope. Install provider tools separately.
 
 Choose where ALE should create or attach each task sandbox:
 
@@ -182,9 +190,8 @@ Set `tasks:` in your experiment to a compatible list:
 | `selected_tasks/docker_support.txt` | 78 | Supported local-container subset |
 
 Difficulty tracks contain 45 near-term, 46 full-spectrum, and 36 last-exam
-tasks. These lists overlap. Published data and images are unchanged: standalone
-data packages 150 tasks (28 inactive), and VM images package 151 (29 inactive,
-including PDE). Inactive payloads are not selected or counted as benchmark tasks.
+tasks. These lists overlap. The Hugging Face data packages cover the 122 selected
+tasks.
 
 Environment profiles default to `output_path: null`, keeping bulk task output
 in the sandbox while collecting metadata, trajectories, evaluations, and

@@ -8,7 +8,7 @@ Substrate IS the host:
 
 Used by harness-style agents that drive the sandbox VM over the
 network from the host (e.g. AleClaw runs the OpenClaw harness loop
-in-process, reaching the eval VM via :attr:`SandboxHandle.endpoint`).
+in a host worker, reaching the eval VM via :attr:`SandboxHandle.endpoint`).
 """
 from __future__ import annotations
 
@@ -68,12 +68,14 @@ class LocalExecutor(BaseExecutor):
             "sandbox_local": False,
             "install_agent_deps": False,
         }
-        for name in ("_result.json", "_worker_result.json", "_done.marker"):
+        for name in ("_result.json", "_worker_result.json", "_done.marker", "_cli_identity.json",
+                     "_agent_started"):
             (work_dir / name).unlink(missing_ok=True)
         spec_path = work_dir / "_spec.json"
         spec_path.write_text(json.dumps(spec))
         write_secrets(work_dir, {**self.env, **secrets})
         process_env = dict(os.environ)
+        process_env.pop("ALE_REFERENCE_ARCHIVE_PASSWORD", None)
         process_env["PYTHONPATH"] = os.pathsep.join(str(Path(path).resolve()) for path in sys.path)
         started = time.monotonic()
         try:
@@ -92,8 +94,11 @@ class LocalExecutor(BaseExecutor):
                     )
                 await asyncio.sleep(0.05)
             out = json.loads((work_dir / "_result.json").read_text())
+            error = out.get("error")
+            if out.get("traceback"):
+                error = f"{error}\n{out['traceback']}" if error else out["traceback"]
             return AgentRunResult(
-                status=out.get("status", "failed"), error=out.get("error"),
+                status=out.get("status", "failed"), error=error,
                 transcript_path=out.get("transcript_path"), stderr_path=out.get("stderr_path"),
                 pid=out.get("pid"), exit_code=out.get("exit_code"),
                 duration_s=out.get("duration_s") or time.monotonic() - started,
@@ -130,6 +135,7 @@ class LocalExecutor(BaseExecutor):
         work_dir = Path(self.work_dir)
         (work_dir / "_stop.request").write_text(self._run_token)
         while True:
+            exited = self._supervisor.poll() is not None
             try:
                 report = json.loads((work_dir / "_stopped.json").read_text())
             except (FileNotFoundError, ValueError):
@@ -140,7 +146,7 @@ class LocalExecutor(BaseExecutor):
                 while self._supervisor.poll() is None:
                     await asyncio.sleep(0.02)
                 return
-            if self._supervisor.poll() is not None:
+            if exited:
                 raise RuntimeError("local supervisor exited without termination confirmation")
             await asyncio.sleep(0.02)
 

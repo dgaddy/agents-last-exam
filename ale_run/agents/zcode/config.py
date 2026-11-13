@@ -41,14 +41,18 @@ class ZCodeConfig:
     missing key is a hard error at install time. Set via ``api_key:
     ${env:HF_INFERENCE_TOKEN}`` in the agent yaml."""
 
-    cli_ref: str = "aac4755666d09fdcd70272fcf063c077a639015f"
+    cli_version: str = "aac4755666d09fdcd70272fcf063c077a639015f"
     """Git ref of https://github.com/zai-org/ZCode to build."""
+    cli_ref: str | None = None
+    """Legacy alias for existing configurations."""
 
     context_window: int = 200000
-    """Context capacity advertised for the configured model."""
+    """Context capacity metadata, independent of the output-token override."""
 
-    max_output_tokens: int = 65536
-    """Output capacity advertised for the configured model."""
+    max_output_tokens: int | None = None
+    """Explicit output-token override. None preserves the pinned CLI's own
+    model metadata and request mapping without adding an adapter output limit.
+    """
 
     reasoning_request: dict[str, object] = field(default_factory=dict)
     """Provider-specific reasoning fields, e.g. {"reasoning_effort": "low"}."""
@@ -57,3 +61,7 @@ class ZCodeConfig:
     """Free-form passthrough env vars exported to the ``zcode`` subprocess
     (e.g. proxy settings). Keys here override anything the deployer would
     otherwise compute."""
+
+    def __post_init__(self) -> None:
+        if self.cli_ref is not None:
+            self.cli_version = self.cli_ref
