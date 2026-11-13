@@ -33,7 +33,8 @@ Judge preflight; `--dry-run` remains a configuration-only preview.
 A failed Judge preflight starts no sandbox, writes no result, and makes
 `ale run` exit with status 3. The probe runs once by default; set
 `ALE_JUDGE_PREFLIGHT_ATTEMPTS` (and optionally
-`ALE_JUDGE_PREFLIGHT_RETRY_DELAY_S`, default 30, doubled per retry) to retry
+`ALE_JUDGE_PREFLIGHT_RETRY_DELAY_S`, default 30, doubled per retry with
+±50% jitter) to retry
 through a brief judge outage. Requests the judge rejects outright (HTTP 4xx
 other than 408, 409 and 429) are not retried.
 

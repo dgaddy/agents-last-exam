@@ -8,6 +8,7 @@ import io
 import logging
 import math
 import os
+import random
 from pathlib import Path
 from typing import Iterable
 
@@ -136,9 +137,13 @@ async def check_judges(units: Iterable[RunUnit]) -> None:
                 status = _http_status(error)
                 failure = type(error).__name__ + (f", HTTP {status}" if status is not None else "")
                 if attempt < attempts and not _is_permanent(status):
-                    delay_s = min(retry_delay_s * 2 ** (attempt - 1), _MAX_RETRY_DELAY_S)
+                    # Jittered so runs that start together do not retry in step.
+                    delay_s = min(
+                        retry_delay_s * 2 ** (attempt - 1) * random.uniform(0.5, 1.5),
+                        _MAX_RETRY_DELAY_S,
+                    )
                     logger.warning(
-                        "Judge %s preflight attempt %d/%d failed (%s); retrying in %gs",
+                        "Judge %s preflight attempt %d/%d failed (%s); retrying in %.0fs",
                         capability, attempt, attempts, failure, delay_s,
                     )
                     await asyncio.sleep(delay_s)
