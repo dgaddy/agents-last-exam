@@ -27,12 +27,17 @@ def build_metrics_summary(
     work_dir: Path,
     *,
     model: str | None,
+    run_completed: bool = False,
 ) -> dict[str, Any]:
     """Write one metrics summary derived from agy's native run artifacts."""
     transcript_path = work_dir / "transcript.jsonl"
     native_log_path = work_dir / "agy_cli.log"
     native_events = list(_iter_jsonl(transcript_path))
-    summary = _summarize_native_events(native_events, model=model)
+    summary = _summarize_native_events(
+        native_events,
+        model=model,
+        run_completed=run_completed,
+    )
     transport_attempts = _parse_transport_attempts(native_log_path)
     summary["native_stream_present"] = transcript_path.exists()
     summary["native_log_present"] = native_log_path.exists()
@@ -55,6 +60,7 @@ def _summarize_native_events(
     native_events: list[dict[str, Any]],
     *,
     model: str | None,
+    run_completed: bool = False,
 ) -> dict[str, Any]:
     model_generations: list[dict[str, Any]] = []
     tool_executions: list[dict[str, Any]] = []
@@ -229,7 +235,11 @@ def _summarize_native_events(
         "result_usage": result_totals,
         "run": {
             "conversation_id": result.get("conversation_id"),
-            "status": result.get("status"),
+            "status": (
+                "SUCCESS"
+                if run_completed and str(result.get("status") or "").upper() == "ERROR"
+                else result.get("status")
+            ),
             "duration_ms": _duration_ms(result.get("duration_seconds")),
             "num_turns": _int_or_none(result.get("num_turns")),
             "model": effective_model,

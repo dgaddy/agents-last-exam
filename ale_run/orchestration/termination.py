@@ -51,6 +51,9 @@ _CATEGORY_PATTERNS: list[tuple[str, tuple[str, ...]]] = [
         (
             "connection reset",
             "connection refused",
+            "connection closed",
+            "use of closed network connection",
+            "unexpected eof",
             "503",
             "service unavailable",
             "deadline exceeded",

@@ -123,6 +123,8 @@ _RETRYABLE_ERROR_SUBSTRINGS: tuple[str, ...] = (
     "504 gateway timeout",
     "model api cannot be reached",
     "remote end closed connection",
+    "use of closed network connection",
+    "connection closed",
     "connection reset",
     "connection refused",
     "broken pipe",
@@ -810,6 +812,16 @@ class AntigravityCliDeployer(BaseAgentDeployer):
                 if append_mode and transcript_file.exists()
                 else 0
             )
+            err_offset = (
+                stderr_log.stat().st_size
+                if append_mode and stderr_log.exists()
+                else 0
+            )
+            log_offset = (
+                agy_log.stat().st_size
+                if append_mode and agy_log.exists()
+                else 0
+            )
             proc = await asyncio.to_thread(
                 _spawn_agy,
                 argv,
@@ -854,7 +866,15 @@ class AntigravityCliDeployer(BaseAgentDeployer):
                     logger.warning("antigravity_cli: failed to stage step screenshots: %s", shot_exc)
 
             exit_code = proc.returncode
-            native_result = _read_result_envelope(transcript_file, offset=tx_offset)
+            attempt_events = _read_native_events(transcript_file, offset=tx_offset)
+            attempt_stderr = _read_text_from_offset(stderr_log, offset=err_offset)
+            raw_result = _read_result_envelope(transcript_file, offset=tx_offset)
+            native_result = _normalize_recovered_result_envelope(
+                raw_result,
+                attempt_events,
+                exit_code=exit_code,
+                stderr_text=attempt_stderr,
+            )
             native_status = str((native_result or {}).get("status") or "").upper()
             status = "completed" if exit_code == 0 and native_status == "SUCCESS" else "failed"
             error = None
@@ -870,7 +890,13 @@ class AntigravityCliDeployer(BaseAgentDeployer):
                 if (
                     attempt < max_retries
                     and exit_code not in (-9, -15, 137, 143)
-                    and _is_retryable_failure(error, stderr_log, agy_log)
+                    and _is_retryable_failure(
+                        error,
+                        stderr_log,
+                        agy_log,
+                        err_offset=err_offset,
+                        log_offset=log_offset,
+                    )
                 ):
                     delay_s = min(_RETRY_BACKOFF_BASE_S * (2**attempt), 60.0)
                     logger.warning(
@@ -1073,6 +1099,18 @@ class AntigravityCliDeployer(BaseAgentDeployer):
             )
         ):
             envelope = native_events[0]
+        init_count = sum(1 for event in native_events if event.get("event") == "init")
+        stderr_for_envelope = (
+            ""
+            if run_result.status == "completed" or init_count > 1
+            else _read_text_tolerant(work_dir / "stderr.log")
+        )
+        envelope = _normalize_recovered_result_envelope(
+            envelope,
+            native_events,
+            exit_code=run_result.exit_code,
+            stderr_text=stderr_for_envelope,
+        )
 
         metadata: dict = {
             "exit_code": run_result.exit_code,
@@ -1135,7 +1173,11 @@ class AntigravityCliDeployer(BaseAgentDeployer):
             )
 
         try:
-            metrics = build_metrics_summary(work_dir, model=config.model or None)
+            metrics = build_metrics_summary(
+                work_dir,
+                model=config.model or None,
+                run_completed=(run_result.status == "completed"),
+            )
         except (OSError, TypeError, ValueError) as exc:
             logger.warning("antigravity_cli: could not build metrics summary: %s", exc)
         else:
@@ -1392,28 +1434,143 @@ def _json_text(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
-def _read_result_envelope(path: Path, *, offset: int = 0) -> dict | None:
-    """Return the last native result record after ``offset`` bytes."""
+def _read_text_from_offset(path: Path, *, offset: int = 0) -> str:
     try:
         with path.open("rb") as stream:
             if offset > 0:
                 stream.seek(offset)
-            text = stream.read().decode("utf-8", errors="replace")
+            return stream.read().decode("utf-8", errors="replace")
     except (FileNotFoundError, OSError):
-        return None
-    for line in reversed(text.splitlines()):
+        return ""
+
+
+def _read_native_events(path: Path, *, offset: int = 0) -> list[dict]:
+    events: list[dict] = []
+    for line in _strip_ansi(_read_text_from_offset(path, offset=offset)).splitlines():
         try:
-            record = json.loads(_strip_ansi(line))
+            record = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if not isinstance(record, dict):
-            continue
+        if isinstance(record, dict):
+            events.append(record)
+    return events
+
+
+def _read_result_envelope(path: Path, *, offset: int = 0) -> dict | None:
+    """Return the last native result record after ``offset`` bytes."""
+    for record in reversed(_read_native_events(path, offset=offset)):
         result = record.get("result")
         if record.get("event") == "result" and isinstance(result, dict):
             return result
         if any(key in record for key in ("response", "status", "usage")):
             return record
     return None
+
+
+def _has_fatal_stderr_marker(stderr_text: str) -> bool:
+    """Return True if agy print mode wrote a fatal EmitError marker to stderr."""
+    for raw_line in _strip_ansi(stderr_text).splitlines():
+        line = raw_line.strip()
+        if line.startswith("error:") or line.startswith("AGY_ERROR"):
+            return True
+    return False
+
+
+def _segment_ended_with_completed_output(
+    native_events: list[dict],
+    envelope: dict,
+) -> bool:
+    """Return True if the active segment's final step completed cleanly."""
+    segment_events = native_events
+    for idx in range(len(native_events) - 1, -1, -1):
+        if native_events[idx].get("event") == "init":
+            segment_events = native_events[idx + 1 :]
+            break
+
+    step_records: dict[int, list[dict]] = {}
+    for event in segment_events:
+        if event.get("event") != "step_update":
+            continue
+        update = event.get("step_update")
+        if not isinstance(update, dict):
+            continue
+        step_index = _optional_int(update.get("step_index"))
+        if step_index is None:
+            continue
+        step_records.setdefault(step_index, []).append(update)
+
+    if not step_records:
+        return False
+
+    final_step_index = max(step_records)
+    records = step_records[final_step_index]
+    terminal = next(
+        (
+            record
+            for record in reversed(records)
+            if record.get("state") in {"DONE", "ERROR"}
+        ),
+        None,
+    )
+    if terminal is None or terminal.get("state") != "DONE":
+        return False
+
+    step_type = str(terminal.get("step_type") or "")
+    if step_type == "agent_response":
+        has_chunks = any(
+            isinstance(r.get("text_delta"), str) and r["text_delta"].strip()
+            for r in records
+        )
+        has_envelope_response = (
+            isinstance(envelope.get("response"), str)
+            and bool(envelope["response"].strip())
+        )
+        return has_chunks or has_envelope_response
+
+    if step_type == "tool" and str(terminal.get("tool_name") or "") == "finish":
+        return envelope.get("structured_output") is not None
+
+    return False
+
+
+def _normalize_recovered_result_envelope(
+    envelope: dict | None,
+    native_events: list[dict],
+    *,
+    exit_code: int | None,
+    stderr_text: str = "",
+) -> dict | None:
+    """Clear stale ERROR status when agy recovered from a mid-run error and exited 0.
+
+    In single-shot ``--output-format stream-json``, agy exits non-zero and writes
+    ``error: ...`` to stderr whenever a turn genuinely fails or truncates after a
+    partial response. However, its JSON envelope builder scans the full step
+    history backward without stopping at the final completed response step, so an
+    earlier transient API error that agy retried and recovered from in-process
+    (or during an earlier resumed turn) still leaves ``status == "ERROR"`` on a
+    clean ``exit_code == 0`` exit.
+    """
+    if exit_code != 0 or not isinstance(envelope, dict):
+        return envelope
+    if str(envelope.get("status") or "").upper() != "ERROR":
+        return envelope
+    if _has_fatal_stderr_marker(stderr_text):
+        return envelope
+    finished_reason = str(envelope.get("finished_reason") or "").strip().lower()
+    if finished_reason in {"print_timeout", "interrupted"}:
+        return envelope
+    raw_error = str(envelope.get("error") or "").strip()
+    if raw_error.startswith("finish tool returned malformed JSON:"):
+        return envelope
+    if not _segment_ended_with_completed_output(native_events, envelope):
+        return envelope
+
+    normalized = dict(envelope)
+    normalized["status"] = "SUCCESS"
+    normalized.pop("error", None)
+    if finished_reason == "error":
+        normalized.pop("finished_reason", None)
+    return normalized
 
 
 def _read_conversation_id(path: Path) -> str | None:
@@ -1444,15 +1601,38 @@ def _read_conversation_id(path: Path) -> str | None:
     return None
 
 
-def _is_retryable_failure(error: str | None, stderr_log: Path, agy_log: Path) -> bool:
+def _strip_benign_monitor_log_lines(log_text: str) -> str:
+    """Drop fail-open background safety-monitor lines that log 403/PERMISSION_DENIED."""
+    return "\n".join(
+        line
+        for line in log_text.splitlines()
+        if "llm_monitor.go:" not in line and "] Monitor " not in line
+    )
+
+
+def _is_retryable_failure(
+    error: str | None,
+    stderr_log: Path,
+    agy_log: Path,
+    *,
+    err_offset: int = 0,
+    log_offset: int = 0,
+) -> bool:
     """Return True if a failed turn aborted on a transient error or token cap."""
-    haystack = "\n".join(
+    primary = "\n".join(
         (
             error or "",
-            _read_text_tolerant(stderr_log)[-4000:],
-            _read_text_tolerant(agy_log)[-4000:],
+            _read_text_from_offset(stderr_log, offset=err_offset)[-4000:],
         )
     ).lower()
-    if any(marker in haystack for marker in _NON_RETRYABLE_ERROR_SUBSTRINGS):
+    if any(marker in primary for marker in _NON_RETRYABLE_ERROR_SUBSTRINGS):
         return False
-    return any(marker in haystack for marker in _RETRYABLE_ERROR_SUBSTRINGS)
+    if any(marker in primary for marker in _RETRYABLE_ERROR_SUBSTRINGS):
+        return True
+
+    filtered_log = _strip_benign_monitor_log_lines(
+        _read_text_from_offset(agy_log, offset=log_offset)[-8000:]
+    ).lower()
+    if any(marker in filtered_log for marker in _NON_RETRYABLE_ERROR_SUBSTRINGS):
+        return False
+    return any(marker in filtered_log for marker in _RETRYABLE_ERROR_SUBSTRINGS)
